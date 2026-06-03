@@ -142,6 +142,59 @@ uv run python <script>.py
 
 ---
 
+## TRELLIS Module
+
+Converts a single image into a Drake-compatible asset using
+[TRELLIS](https://github.com/microsoft/TRELLIS) (Microsoft).
+Produces a textured **GLB** (bonus) plus a normalized **OBJ + SDF** ready for Drake manipulation.
+
+| Target | File | Hardware |
+|--------|------|----------|
+| `trellis` | `trellis/Dockerfile` | Jetson (JetPack 6.1, CUDA 12.2, ARM64) |
+
+### Output structure
+
+Running the pipeline for an image named `mug.png` produces:
+
+```
+assets/
+└── mug/
+    ├── mug.glb              ← textured mesh from TRELLIS (PBR, bonus artifact)
+    ├── mug.obj              ← normalized mesh (longest axis = 20 cm)
+    ├── mug.sdf              ← Drake SDF with inertia + convex collisions
+    └── mug_parts/
+        └── convex_piece_000.obj
+```
+
+### Build the image
+
+```bash
+docker build -t trellis -f trellis/Dockerfile trellis/
+```
+
+The build clones TRELLIS, compiles `spconv` from source for ARM64, and pre-downloads
+`JeffreyXiang/TRELLIS-image-large` (~3 GB). No network access is needed at inference time.
+Build time: ~20–30 min on Jetson (spconv compilation dominates).
+
+### Generate an asset
+
+```bash
+# Minimum quality (default — fastest)
+python tools/generate_asset_trellis.py path/to/image.png --name mug
+
+# Higher quality
+python tools/generate_asset_trellis.py path/to/image.png --name mug --steps 12 --texture-size 1024
+```
+
+| Flag | Default | Max | Effect |
+|------|---------|-----|--------|
+| `--steps` | 4 | 12 | Diffusion steps for both sparse-structure and SLAT samplers |
+| `--texture-size` | 512 | 1024 | Texture map resolution baked into the GLB |
+
+Assets are saved to `assets/<name>/` relative to the repo root.
+
+---
+
 ## Troubleshooting
 
 | Problem | Cause | Fix |
