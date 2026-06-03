@@ -9,10 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-dev libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Reset pip index to standard PyPI (dustynv base uses a Jetson-specific index
-# that may not resolve during build)
-RUN pip config set global.index-url https://pypi.org/simple && \
-    pip config unset global.extra-index-url || true
+# Override Jetson pip index (pypi.jetson-ai-lab.dev doesn't resolve during build)
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_EXTRA_INDEX_URL=""
 
 # Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip
