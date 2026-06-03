@@ -34,22 +34,11 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # ── 4. Pipeline modules ──────────────────────────────────────────────────────
 COPY image_utils.py mesh_utils.py sdf_generator.py pipeline.py /app/
 
-# ── 5. Pre-download all models at build time (zero network at inference) ─────
-ENV HF_HOME=/opt/models/huggingface
-RUN python3 - <<'EOF'
-from huggingface_hub import hf_hub_download
-print("Downloading TripoSR weights (~1.7 GB)...")
-hf_hub_download("stabilityai/TripoSR", "config.yaml")
-hf_hub_download("stabilityai/TripoSR", "model.ckpt")
-print("Downloading DINO-ViT config...")
-hf_hub_download("facebook/dino-vitb16", "config.json")
-print("Downloading rembg U²-Net model (~176 MB)...")
-import rembg
-rembg.new_session()
-print("All models pre-downloaded successfully.")
-EOF
-
-# ── 6. Runtime environment ───────────────────────────────────────────────────
+# ── 5. Runtime environment ───────────────────────────────────────────────────
+# Models are downloaded once on the host and mounted at runtime via:
+#   -v ~/models/huggingface:/root/.cache/huggingface
+# Run `python3 tools/download_models.py` on the host to pre-download them.
+ENV HF_HOME=/root/.cache/huggingface
 ENV PYTHONPATH=/opt/triposr:/app
 ENV PYTHONWARNINGS=ignore::FutureWarning,ignore::UserWarning
 ENV TRANSFORMERS_VERBOSITY=error

@@ -26,6 +26,7 @@ def build_docker_command(image_path: Path, project_root: Path, name: str, cpu: b
     image_path = image_path.resolve()
     assets_dir = (project_root / "assets").resolve()
     assets_dir.mkdir(parents=True, exist_ok=True)
+    models_dir = Path.home() / "models" / "huggingface"
 
     image = IMAGE_NAME_CPU if cpu else IMAGE_NAME
     gpu_flags = [] if cpu else ["--gpus", "all"]
@@ -35,6 +36,7 @@ def build_docker_command(image_path: Path, project_root: Path, name: str, cpu: b
         *gpu_flags,
         "-v", f"{image_path.parent}:/input:ro",
         "-v", f"{assets_dir}:/output",
+        "-v", f"{models_dir}:/root/.cache/huggingface",
         image,
         "--input", f"/input/{image_path.name}",
         "--output", "/output",
