@@ -1,0 +1,25 @@
+# TripoSR is installed from source (--no-deps) to preserve L4T ARM64 torch.
+# torchmcubes is built via cmake in the Dockerfile — not listed here.
+
+# ── TripoSR core ─────────────────────────────────────────────────────────────
+einops
+omegaconf
+transformers==4.35.0
+huggingface-hub==0.17.3
+safetensors
+tokenizers==0.14.1
+
+# ── Mesh processing ───────────────────────────────────────────────────────────
+trimesh>=4.0.0
+scipy
+
+# ── Convex decomposition ──────────────────────────────────────────────────────
+coacd
+
+# ── Background removal ────────────────────────────────────────────────────────
+rembg==2.0.69
+onnxruntime
+
+# ── Image / numerics ──────────────────────────────────────────────────────────
+Pillow>=10.0.0
+numpy
