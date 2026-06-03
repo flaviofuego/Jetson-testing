@@ -1,0 +1,27 @@
+# PyTorch is installed separately via the CPU wheel index — do NOT add it here.
+# torchmcubes is installed via git+cmake in the Dockerfile — not here either.
+# TripoSR itself is installed from source with --no-deps — its transitive deps below.
+
+# ── TripoSR core ─────────────────────────────────────────────────────────────
+einops==0.7.0
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3
+transformers==4.35.0
+huggingface-hub==0.17.3
+safetensors
+tokenizers==0.14.1
+
+# ── Mesh processing ───────────────────────────────────────────────────────────
+trimesh>=4.0.0
+scipy
+
+# ── Convex decomposition (optional; pipeline falls back to convex hull) ───────
+coacd
+
+# ── Background removal ────────────────────────────────────────────────────────
+rembg==2.0.69
+onnxruntime
+
+# ── Image / numerics ──────────────────────────────────────────────────────────
+Pillow>=10.0.0
+numpy==1.26.4

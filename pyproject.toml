@@ -1,0 +1,27 @@
+[project]
+name = "aira"
+version = "0.1.0"
+description = "Autonomous Intelligent Robotic Arm - robotics manipulation research with Drake"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "drake",
+    "manipulation",
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pydot",
+    "ipython",
+    "typeguard",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "trimesh",
+    "Pillow",
+    "numpy",
+]
+
+[tool.uv]
+# Drake and manipulation are distributed via Drake's own package index
+extra-index-url = ["https://drake-packages.csail.mit.edu/whl/nightly"]
