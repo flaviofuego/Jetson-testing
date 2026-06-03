@@ -1,5 +1,5 @@
 # ARM64 base with PyTorch pre-built for Jetson (JetPack 6 / L4T R36.4)
-FROM dustynv/torch:2.3-r36.4.0
+FROM dustynv/pytorch:2.6-r36.4.0-cu128
 
 WORKDIR /app
 
