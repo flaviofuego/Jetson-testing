@@ -9,13 +9,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-dev libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
+# Reset pip index to standard PyPI (dustynv base uses a Jetson-specific index
+# that may not resolve during build)
+RUN pip config set global.index-url https://pypi.org/simple && \
+    pip config unset global.extra-index-url || true
+
 # Upgrade pip
 RUN pip install --no-cache-dir --upgrade pip
 
 # ── 1. TripoSR (no setup.py/pyproject.toml — use via PYTHONPATH) ────────────
 RUN git clone https://github.com/VAST-AI-Research/TripoSR.git /opt/triposr
 
-# ── 2. torchmcubes — built against L4T torch (CUDA available on Jetson) ─────
+# ── 2. torchmcubes build deps + build against Jetson torch (CUDA on ARM64) ──
+RUN pip install --no-cache-dir scikit-build-core cmake ninja
 RUN TORCH_DIR=$(python3 -c \
       "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'share/cmake/Torch'))") \
     && CMAKE_ARGS="-DTorch_DIR=${TORCH_DIR}" \
