@@ -1,5 +1,5 @@
-# ARM64 base with PyTorch pre-built for Jetson (JetPack 6 / L4T R36)
-FROM nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.1-py3
+# ARM64 base with PyTorch pre-built for Jetson (JetPack 6 / L4T R36.4)
+FROM dustynv/pytorch:2.6-r36.4.0-cu128
 
 WORKDIR /app
 
