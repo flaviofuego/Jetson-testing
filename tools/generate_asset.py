@@ -29,7 +29,7 @@ def build_docker_command(image_path: Path, project_root: Path, name: str, cpu: b
     models_dir = Path.home() / "models" / "huggingface"
 
     image = IMAGE_NAME_CPU if cpu else IMAGE_NAME
-    gpu_flags = [] if cpu else ["--gpus", "all"]
+    gpu_flags = [] if cpu else ["--runtime=nvidia"]
 
     return [
         "docker", "run", "--rm",
