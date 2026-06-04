@@ -1,0 +1,3 @@
+[submodule "dvlt.cu"]
+	path = dvlt.cu
+	url = https://github.com/flaviofuego/dvlt.cu
