@@ -54,8 +54,8 @@ def main():
     parser.add_argument("--output",     required=True,  type=Path, help="Output assets root dir")
     parser.add_argument("--name",       required=True,  type=str,  help="Asset name")
     parser.add_argument("--device",     default="cuda", choices=["cuda", "cpu"])
-    parser.add_argument("--chunk-size", default=131072, type=int,
-                        help="Renderer chunk size — larger = faster but more VRAM (default: 131072)")
+    parser.add_argument("--chunk-size", default=262144, type=int,
+                        help="Renderer chunk size — larger = faster but more VRAM (default: 262144)")
     parser.add_argument("--resolution", default=256,    type=int,
                         help="Mesh extraction resolution (default: 256)")
     args = parser.parse_args()
@@ -67,7 +67,7 @@ def main():
     print(f"[1/5] Preprocessing image: {args.input}")
     image = preprocess_image(args.input)
 
-    print(f"[2/5] Running TripoSR on {args.device} (chunk={args.chunk_size}, res={args.resolution}, fp16={args.device=='cuda'})...")
+    print(f"[2/5] Running TripoSR on {args.device} (chunk={args.chunk_size}, res={args.resolution}, fp16={args.device == 'cuda'})...")
     raw_mesh = run_triposr(image, device=args.device, chunk_size=args.chunk_size, resolution=args.resolution)
 
     print("[3/5] Normalizing mesh (longest axis → 20 cm)...")
