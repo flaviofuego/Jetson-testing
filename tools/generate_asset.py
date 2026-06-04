@@ -27,6 +27,8 @@ def build_docker_command(image_path: Path, project_root: Path, name: str, cpu: b
     assets_dir = (project_root / "assets").resolve()
     assets_dir.mkdir(parents=True, exist_ok=True)
     models_dir = Path.home() / "models" / "huggingface"
+    u2net_dir = Path.home() / ".u2net"
+    u2net_dir.mkdir(parents=True, exist_ok=True)
 
     image = IMAGE_NAME_CPU if cpu else IMAGE_NAME
     gpu_flags = [] if cpu else ["--runtime=nvidia"]
@@ -37,6 +39,7 @@ def build_docker_command(image_path: Path, project_root: Path, name: str, cpu: b
         "-v", f"{image_path.parent}:/input:ro",
         "-v", f"{assets_dir}:/output",
         "-v", f"{models_dir}:/root/.cache/huggingface",
+        "-v", f"{u2net_dir}:/root/.u2net",
         image,
         "--input", f"/input/{image_path.name}",
         "--output", "/output",
