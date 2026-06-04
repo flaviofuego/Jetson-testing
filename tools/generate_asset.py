@@ -1,10 +1,11 @@
 """
-Host-side wrapper: builds and calls the triposr Docker container.
+Host-side wrapper: builds and calls TripoSR or TRELLIS Docker containers.
 
 Usage:
-    python tools/generate_asset.py path/to/image.png
-    python tools/generate_asset.py path/to/image.png --name mug
-    python tools/generate_asset.py path/to/image.png --cpu        # CPU image
+    python tools/generate_asset.py path/to/image.png                   # TripoSR GPU
+    python tools/generate_asset.py path/to/image.png --name mug        # custom name
+    python tools/generate_asset.py path/to/image.png --cpu             # TripoSR CPU
+    python tools/generate_asset.py path/to/image.png --model trellis   # TRELLIS GPU
 """
 import argparse
 import subprocess
@@ -12,26 +13,33 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
-IMAGE_NAME = "triposr"
-IMAGE_NAME_CPU = "triposr:cpu"
+
+IMAGES = {
+    "triposr":     "triposr",
+    "triposr-cpu": "triposr:cpu",
+    "trellis":     "trellis",
+}
 
 
 def resolve_asset_name(image_path: Path, name: str | None) -> str:
-    if name:
-        return name
-    return image_path.stem
+    return name or image_path.stem
 
 
-def build_docker_command(image_path: Path, project_root: Path, name: str, cpu: bool) -> list[str]:
+def build_docker_command(image_path: Path, project_root: Path, name: str,
+                         model: str, cpu: bool) -> list[str]:
     image_path = image_path.resolve()
     assets_dir = (project_root / "assets").resolve()
     assets_dir.mkdir(parents=True, exist_ok=True)
     models_dir = Path.home() / "models" / "huggingface"
-    u2net_dir = Path.home() / ".u2net"
+    u2net_dir  = Path.home() / ".u2net"
     u2net_dir.mkdir(parents=True, exist_ok=True)
 
-    image = IMAGE_NAME_CPU if cpu else IMAGE_NAME
-    gpu_flags = [] if cpu else ["--runtime=nvidia"]
+    if cpu:
+        image = IMAGES["triposr-cpu"]
+        gpu_flags = []
+    else:
+        image = IMAGES[model]
+        gpu_flags = ["--runtime=nvidia"]
 
     return [
         "docker", "run", "--rm",
@@ -41,19 +49,21 @@ def build_docker_command(image_path: Path, project_root: Path, name: str, cpu: b
         "-v", f"{models_dir}:/root/.cache/huggingface",
         "-v", f"{u2net_dir}:/root/.u2net",
         image,
-        "--input", f"/input/{image_path.name}",
+        "--input",  f"/input/{image_path.name}",
         "--output", "/output",
-        "--name", name,
+        "--name",   name,
     ]
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate an OBJ+SDF asset from an image using TripoSR"
+        description="Generate a 3D asset from an image using TripoSR or TRELLIS"
     )
     parser.add_argument("image", type=Path, help="Path to input PNG/JPG image")
-    parser.add_argument("--name", default=None, help="Asset name (default: image filename stem)")
-    parser.add_argument("--cpu", action="store_true", help="Use CPU image instead of GPU")
+    parser.add_argument("--name",  default=None, help="Asset name (default: image stem)")
+    parser.add_argument("--model", default="triposr", choices=["triposr", "trellis"],
+                        help="Model to use (default: triposr)")
+    parser.add_argument("--cpu",   action="store_true", help="TripoSR CPU-only mode")
     args = parser.parse_args()
 
     if not args.image.exists():
@@ -61,9 +71,9 @@ def main():
         sys.exit(1)
 
     name = resolve_asset_name(args.image, args.name)
-    cmd = build_docker_command(args.image, PROJECT_ROOT, name, args.cpu)
+    cmd  = build_docker_command(args.image, PROJECT_ROOT, name, args.model, args.cpu)
 
-    print(f"Generating asset '{name}' from {args.image}")
+    print(f"Generating asset '{name}' from {args.image} using {args.model.upper()}")
     print(f"Running: {' '.join(cmd)}\n")
 
     result = subprocess.run(cmd)
@@ -73,9 +83,6 @@ def main():
 
     asset_path = PROJECT_ROOT / "assets" / name
     print(f"\nAsset generated at: {asset_path}")
-    print(f"  {name}.obj")
-    print(f"  {name}.sdf")
-    print(f"  {name}_parts/")
 
 
 if __name__ == "__main__":

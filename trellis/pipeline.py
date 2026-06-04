@@ -10,6 +10,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 
 import argparse
 import logging
+import time
 from pathlib import Path
 
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -62,6 +63,7 @@ def main():
     parts_dir = asset_dir / f"{args.name}_parts"
     asset_dir.mkdir(parents=True, exist_ok=True)
 
+    t_start = time.time()
     print(f"[1/6] Preprocessing image: {args.input}")
     image = preprocess_image(args.input)
 
@@ -100,7 +102,8 @@ def main():
     sdf_path.write_text(generate_sdf(args.name, mesh, relative_parts))
     print(f"      Saved: {sdf_path}")
 
-    print(f"\nDone → {asset_dir}/")
+    elapsed = time.time() - t_start
+    print(f"\nDone → {asset_dir}/  ({elapsed:.1f}s total)")
     print(f"  {args.name}.glb   (textured)")
     print(f"  {args.name}.obj   (Drake visual)")
     print(f"  {args.name}.sdf   (Drake SDF)")
