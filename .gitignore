@@ -19,3 +19,5 @@ Thumbs.db
 # Superpowers internal docs (not part of project)
 docs/superpowers/
 /assets
+/dvlt.cu
+tools/download_models_trellis_windows.py
