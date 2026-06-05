@@ -4,8 +4,8 @@ version = "0.1.0"
 description = "Autonomous Intelligent Robotic Arm - robotics manipulation research with Drake"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "drake",
-    "manipulation",
+    "drake; sys_platform != 'win32'",
+    "manipulation; sys_platform != 'win32'",
     "numpy",
     "scipy",
     "matplotlib",
