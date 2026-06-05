@@ -12,6 +12,7 @@ def normalize_mesh(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
 
 
 def decompose_convex(mesh: trimesh.Trimesh, output_dir: Path, name: str) -> list[Path]:
+    """Decompose mesh into convex parts via coacd. Only available inside Docker."""
     import coacd
     output_dir.mkdir(parents=True, exist_ok=True)
     m = coacd.Mesh(np.array(mesh.vertices, dtype=np.float64),

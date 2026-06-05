@@ -2,7 +2,7 @@ from pathlib import Path
 import trimesh
 import numpy as np
 
-_MASS = 0.1  # kg
+_MASS = 0.1  # kg, consistent with all existing AIRA assets
 
 
 def generate_sdf(name: str, mesh: trimesh.Trimesh, parts: list[Path]) -> str:
