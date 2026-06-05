@@ -42,10 +42,17 @@ def ply_to_obj(ply_path: Path, obj_path: Path, depth: int, density_threshold: fl
             mesh.remove_vertices_by_mask(vertices_to_remove)
 
     mesh.compute_vertex_normals()
-
-    obj_path.parent.mkdir(parents=True, exist_ok=True)
-    o3d.io.write_triangle_mesh(str(obj_path), mesh)
     print(f"  {len(mesh.triangles):,} triángulos")
+
+    # Exportar via trimesh (más confiable que open3d para OBJ)
+    import numpy as np
+    import trimesh
+    vertices  = np.asarray(mesh.vertices)
+    faces     = np.asarray(mesh.triangles)
+    normals   = np.asarray(mesh.vertex_normals)
+    tm = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals)
+    obj_path.parent.mkdir(parents=True, exist_ok=True)
+    tm.export(str(obj_path))
     print(f"Guardado: {obj_path}")
 
 
