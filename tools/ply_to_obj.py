@@ -27,14 +27,19 @@ def ply_to_obj(ply_path: Path, obj_path: Path, depth: int, density_threshold: fl
     pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
     pcd.orient_normals_consistent_tangent_plane(k=15)
 
-    print(f"Reconstruyendo mesh (depth={depth})...")
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+    print(f"Reconstruyendo mesh (Ball Pivoting)...")
+    radii = [0.005, 0.01, 0.02, 0.04]
+    mesh = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector(radii)
+    )
 
-    if density_threshold > 0:
-        import numpy as np
-        vertices_to_remove = densities < (np.quantile(densities, density_threshold))
-        mesh.remove_vertices_by_mask(vertices_to_remove)
-        print(f"  Filtrado por densidad (quantile={density_threshold})")
+    if len(mesh.triangles) == 0:
+        print("  Ball Pivoting no generó triángulos, usando Poisson...")
+        mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+        if density_threshold > 0:
+            import numpy as np
+            vertices_to_remove = densities < (np.quantile(densities, density_threshold))
+            mesh.remove_vertices_by_mask(vertices_to_remove)
 
     mesh.compute_vertex_normals()
 
