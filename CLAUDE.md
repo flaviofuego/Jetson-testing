@@ -1,115 +1,128 @@
-# Jetson Testing — TripoSR Asset Pipeline
+# Jetson Testing — Asset Pipeline
 
 ## Proyecto
 
-Convierte una imagen (PNG/JPG) en un **mesh 3D + Drake SDF** listo para simulación de manipulación robótica.
+Tres pipelines para generar assets 3D desde imágenes, listos para simulación robótica con Drake.
 
-Stack: TripoSR (reconstrucción 3D) + coacd (descomposición convexa) + Drake SDF.
+| Pipeline | Modelo | Entrada | Salida |
+|----------|--------|---------|--------|
+| TripoSR | TripoSR (Stability AI) | 1 imagen | OBJ + SDF |
+| TRELLIS | TRELLIS-image-large (Microsoft) | 1 imagen | GLB + OBJ + SDF |
+| dvlt.cu | DVLT (NVIDIA) | 1+ imágenes | PLY gaussiano → OBJ |
 
 ## Hardware / Conexión
 
-- Jetson Orin NX Developer Kit Super, JetPack 6 / L4T R36
-- SSH: `ssh jetson` (usuario: `jetson`, IP dinámica — si falla: `arp -a | findstr "192.168.1"` en PowerShell)
-- Dentro de la Jetson: usar **tmux** para no perder procesos si cae SSH (`tmux attach` para reconectar)
+- Jetson Orin NX Developer Kit Super, JetPack 6 / L4T R36.4.7, 16 GB RAM unificada
+- SSH: `ssh jetson` (usuario: `jetson`, IP dinámica — si falla buscar con `arp -a | findstr "192.168.1"`)
+- IP actual: `192.168.1.43` (puede cambiar — DHCP)
+- Siempre usar **tmux** en la Jetson para no perder procesos si cae SSH
 
 ## Estructura del repo
 
 ```
 triposr/
-  Dockerfile          # GPU — base l4t-pytorch:r36.2.0-pth2.1-py3
-  Dockerfile.cpu      # CPU — base python:3.12-slim
-  pipeline.py         # Entrypoint del contenedor (5 pasos: preprocess → TripoSR → normalize → coacd → SDF)
-  image_utils.py      # Preprocesamiento de imagen (rembg background removal)
-  mesh_utils.py       # normalize_mesh (eje más largo → 20 cm) + decompose_convex (coacd)
-  sdf_generator.py    # Genera Drake SDF con inercia + colisiones convexas
-  requirements.txt    # Deps GPU (sin torch — viene del base l4t-pytorch)
+  Dockerfile            # GPU — base dustynv/pytorch:2.6-r36.4.0-cu128
+  Dockerfile.cpu        # CPU — base python:3.12-slim
+  pipeline.py           # preprocess → TripoSR (FP16) → normalize → coacd → SDF
+  image_utils.py
+  mesh_utils.py
+  sdf_generator.py
+  requirements.txt
   requirements.cpu.txt
+trellis/
+  Dockerfile            # GPU — base dustynv/pytorch:2.7-r36.4.0
+  pipeline.py           # preprocess → TRELLIS → GLB → OBJ → coacd → SDF
+  image_utils.py
+  mesh_utils.py
+  sdf_generator.py
+  requirements.txt
+dvlt.cu/                # submodulo — reconstrucción 3D gaussiana
+  run_dvlt.sh           # wrapper para correr dvlt con una carpeta de imágenes
 tools/
-  generate_asset.py   # Wrapper host-side: llama Docker, monta volúmenes, guarda en assets/
-quick_test.py         # Test directo sin Docker (Linux/CUDA)
-quick_test_cpu_windows.py  # Test directo sin Docker (Windows CPU)
-pyproject.toml        # Entorno Drake/AIRA (uv) — NO incluye TripoSR (conflictos de versiones)
+  generate_asset.py         # wrapper principal (soporta triposr y trellis)
+  download_models.py        # descarga modelos TripoSR en la Jetson
+  download_models_trellis.py        # descarga modelos TRELLIS en la Jetson
+  download_models_trellis_windows.py # descarga modelos TRELLIS en Windows + scp a Jetson
+  ply_to_obj.py             # convierte PLY gaussiano (dvlt) a OBJ mesh
 ```
 
 ## Imágenes Docker
 
-| Target | Dockerfile | Hardware |
-|--------|-----------|----------|
-| `triposr` | `triposr/Dockerfile` | Jetson GPU (CUDA, ARM64) — base: dustynv/torch:2.3-r36.4.0 |
-| `triposr:cpu` | `triposr/Dockerfile.cpu` | Cualquier máquina, CPU |
+| Tag | Dockerfile | Base | Hardware |
+|-----|-----------|------|----------|
+| `triposr` | `triposr/Dockerfile` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
+| `triposr:cpu` | `triposr/Dockerfile.cpu` | `python:3.12-slim` | CPU cualquier máquina |
+| `trellis` | `trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU |
+| `dvlt:jetson` | `dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU |
 
 ## Comandos principales
 
-### Verificar Docker + GPU en la Jetson
+### TripoSR — generar asset
 ```bash
-docker run --rm --gpus all nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.1-py3 \
-  python3 -c "import torch; print(torch.cuda.is_available())"
+# Descargar modelos (una sola vez)
+python3 tools/generate_asset.py data/images/imagen.png --name objeto
+
+# Con más detalle de tiempo
+# El output incluye: Xs total al final
 ```
 
-### Build (una sola vez — baja modelos ~2 GB)
+### TRELLIS — generar asset
 ```bash
-# GPU (en la Jetson)
-docker build -t triposr -f triposr/Dockerfile triposr/
+# Descargar modelos en Jetson (una sola vez)
+python3 tools/download_models_trellis.py
 
-# CPU (cualquier máquina)
-docker build -t triposr:cpu -f triposr/Dockerfile.cpu triposr/
+# Generar (desde Jetson-testing/)
+python3 tools/generate_asset.py data/images/imagen.png --name objeto --model trellis
 ```
 
-### Generar asset
+### dvlt — reconstrucción gaussiana
 ```bash
-# Recomendado — wrapper automático
-python tools/generate_asset.py path/to/image.png --name mug        # GPU
-python tools/generate_asset.py path/to/image.png --name mug --cpu  # CPU
+# Setup (una sola vez)
+mkdir -p ~/dvlt.cu/model
+docker run --rm --runtime nvidia -v ~/dvlt.cu/model:/dvlt/model dvlt:jetson --setup
 
-# Docker directo
-docker run --rm --gpus all \
-  -v /ruta/absoluta/imagenes:/input:ro \
-  -v /ruta/absoluta/assets:/output \
-  triposr \
-  --input /input/image.png --output /output --name mug
+# Correr con carpeta de imágenes
+cd ~/Jetson-testing
+./dvlt.cu/run_dvlt.sh ~/Jetson-testing/data/images/taza taza
 ```
 
-### Salida esperada
-```
-assets/mug/
-  mug.obj              # mesh normalizado (eje más largo = 20 cm)
-  mug.sdf              # Drake SDF con inercia + colisiones convexas
-  mug_parts/
-    convex_piece_000.obj
-    convex_piece_001.obj
+### PLY → OBJ (post-proceso dvlt)
+```bash
+python3 tools/ply_to_obj.py ~/dvlt.cu/output/<timestamp>/scene.ply --output ~/dvlt.cu/meshes/nombre.obj
 ```
 
-## Setup en la Jetson (pasos pendientes)
+### Transferir resultados a Windows
+```powershell
+# Assets TripoSR/TRELLIS
+wsl rsync -av jetson@192.168.1.43:~/Jetson-testing/assets/ /mnt/c/Users/flavi/.../assets/
 
-1. **Verificar Docker con GPU:**
-   ```bash
-   docker --version
-   docker run --rm --gpus all nvcr.io/nvidia/l4t-pytorch:r36.2.0-pth2.1-py3 python3 -c "import torch; print(torch.cuda.is_available())"
-   ```
+# Meshes dvlt
+wsl rsync -av jetson@192.168.1.43:~/dvlt.cu/meshes/ /mnt/c/Users/flavi/.../dvlt.cu/meshes/
+```
 
-2. **Clonar/transferir el repo** a la Jetson:
-   ```bash
-   git clone <repo-url> ~/jetson-testing
-   # O desde Windows:
-   scp -r . jetson:~/jetson-testing
-   ```
+## Modelos y caché
 
-3. **Build de la imagen Docker GPU** (tarda ~20-30 min, baja ~2 GB de modelos):
-   ```bash
-   cd ~/jetson-testing
-   docker build -t triposr -f triposr/Dockerfile triposr/
-   ```
+Los modelos se guardan en el host de la Jetson y se montan en Docker:
 
-4. **Probar con una imagen:**
-   ```bash
-   python3 tools/generate_asset.py test_image.png --name test
-   ```
+| Modelo | Ubicación en Jetson | Tamaño |
+|--------|-------------------|--------|
+| TripoSR weights | `~/models/huggingface/` | ~1.7 GB |
+| DINO-ViT config | `~/models/huggingface/` | - |
+| rembg U2-Net | `~/.u2net/` | ~176 MB |
+| TRELLIS-image-large | `~/models/huggingface/` | ~3 GB |
+| dvlt weights | `~/dvlt.cu/model/` | ~468 MB |
+
+## Optimizaciones activas (TripoSR)
+
+- **FP16** en GPU (Ampere, nativo en Orin)
+- **chunk_size = 262144** (16 GB RAM unificada)
+- `sudo nvpmodel -m 0 && sudo jetson_clocks` antes de inferencia
 
 ## Notas importantes
 
-- El `Dockerfile` GPU usa `l4t-pytorch:r36.2.0-pth2.1-py3` como base — NO instala PyTorch por separado, ya viene en la imagen base de NVIDIA para Jetson.
-- `torchmcubes` se compila desde fuente en el build de Docker (requiere cmake, g++, ninja).
-- `coacd` puede fallar en ARM64; el pipeline tiene fallback automático a convex hull.
-- Los modelos se descargan **en el build** (no en inferencia) — `HF_HOME=/opt/models/huggingface` dentro del contenedor.
-- El entorno `pyproject.toml` (uv/Drake) es independiente del entorno TripoSR — tienen conflictos de versiones, por eso TripoSR siempre corre en Docker.
-- Para tests rápidos sin Docker en Windows usar `quick_test_cpu_windows.py` con TripoSR clonado en `PYTHONPATH`.
+- Docker usa `--runtime=nvidia` (no `--gpus all`) en esta Jetson
+- Los assets generados por Docker son propiedad de root — usar `sudo chown -R jetson:jetson ~/Jetson-testing/assets` si hay problemas de permisos
+- El entorno `pyproject.toml` (uv/Drake) es independiente — NO incluye TripoSR ni TRELLIS (conflictos de versiones)
+- `dvlt.cu` es un submódulo git — clonar con `git clone --recurse-submodules`
+- `git config --global submodule.recurse true` para que pull/fetch actualice submódulos automáticamente
+- La IP de la Jetson cambia por DHCP — pendiente configurar IP estática en el router
