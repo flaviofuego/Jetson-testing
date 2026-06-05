@@ -44,10 +44,20 @@ def build_docker_command(
     extra_args: list[str],
 ) -> list[str]:
     depth_path = depth_path.resolve()
-    input_dir = depth_path.parent
     assets_dir = (project_root / "assets").resolve()
     assets_dir.mkdir(parents=True, exist_ok=True)
     models_dir = MODELS_DIR.resolve()
+
+    # All input files must be in the same directory so a single volume mount works.
+    # We use the depth file's directory as the input mount point and verify the
+    # other files live there too.
+    input_dir = depth_path.parent
+    for label, path in [("color", color_path), ("intrinsics", intrinsics_path)]:
+        if path is not None and Path(path).resolve().parent != input_dir:
+            raise ValueError(
+                f"--{label} must be in the same directory as --depth ({input_dir}).\n"
+                f"Got: {path}"
+            )
 
     if x86:
         image = IMAGE_X86
@@ -69,10 +79,10 @@ def build_docker_command(
     ]
 
     if color_path is not None:
-        cmd += ["--color", f"/input/{color_path.name}"]
+        cmd += ["--color", f"/input/{Path(color_path).name}"]
 
     if intrinsics_path is not None:
-        cmd += ["--intrinsics", f"/input/{intrinsics_path.name}"]
+        cmd += ["--intrinsics", f"/input/{Path(intrinsics_path).name}"]
     elif all(v is not None for v in [fx, fy, cx, cy]):
         cmd += ["--fx", str(fx), "--fy", str(fy), "--cx", str(cx), "--cy", str(cy)]
 
