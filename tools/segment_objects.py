@@ -158,16 +158,36 @@ def _reconstruct_in_subprocess(pcd, o3d, obj_path: Path, ply_path, depth: int, d
     for line in result.stdout.splitlines():
         print(f"    {line}")
 
+    if result.returncode != 0:
+        # SIGSEGV (-11): reintentar con depth reducido
+        if result.returncode == -11 and depth > 6:
+            retry_depth = depth - 2
+            print(f"    Segfault — reintentando con depth {retry_depth}...")
+            args_retry = json.dumps({
+                "ply_in": tmp_ply,
+                "obj_out": str(obj_path),
+                "ply_save": "",
+                "depth": retry_depth,
+                "density_threshold": density_threshold,
+            })
+            result2 = subprocess.run(
+                [sys.executable, str(worker), args_retry],
+                capture_output=True, text=True
+            )
+            for line in result2.stdout.splitlines():
+                print(f"    {line}")
+            if result2.returncode != 0:
+                print(f"    Error en reintento (código {result2.returncode}) — cluster omitido")
+        else:
+            print(f"    Error en reconstrucción (código {result.returncode}) — cluster omitido")
+            lines = [l for l in result.stderr.splitlines() if l.strip() and "[ERROR]" not in l]
+            if lines:
+                print(f"    {lines[-1]}")
+
     try:
         os.unlink(tmp_ply)
     except OSError:
         pass
-
-    if result.returncode != 0:
-        print(f"    Error en reconstrucción (código {result.returncode})")
-        lines = [l for l in result.stderr.splitlines() if l.strip() and "[ERROR]" not in l]
-        if lines:
-            print(f"    {lines[-1]}")
 
 
 def segment_objects(
