@@ -92,15 +92,26 @@ def filter_clusters(clusters, min_size: float, max_size: float, count):
 
 
 def reconstruct_mesh(pcd, o3d, depth: int, density_threshold: float):
-    """Poisson reconstruction con radio de normales adaptado al bounding box del cluster."""
+    """Poisson reconstruction con radio de normales adaptado al bounding box del cluster.
+    Reduce depth automáticamente para clusters escasos."""
     import numpy as np
+    n_points = len(pcd.points)
+    # Poisson a depth D necesita ~8^D puntos para ser estable; bajamos si hay pocos
+    auto_depth = depth
+    if n_points < 5_000:
+        auto_depth = min(depth, 7)
+    if n_points < 1_000:
+        auto_depth = min(depth, 6)
+    if auto_depth != depth:
+        print(f"    depth auto-reducido {depth}→{auto_depth} ({n_points:,} puntos)")
+
     bbox = pcd.get_axis_aligned_bounding_box()
     radius = float(bbox.get_max_extent()) * 0.05
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30)
     )
     pcd.orient_normals_consistent_tangent_plane(k=15)
-    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=depth)
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=auto_depth)
     if density_threshold > 0:
         vertices_to_remove = densities < np.quantile(densities, density_threshold)
         mesh.remove_vertices_by_mask(vertices_to_remove)
@@ -117,6 +128,46 @@ def mesh_to_obj(mesh, obj_path: Path):
     tm = trimesh.Trimesh(vertices=vertices, faces=faces, vertex_normals=normals)
     obj_path.parent.mkdir(parents=True, exist_ok=True)
     tm.export(str(obj_path))
+
+
+def _reconstruct_in_subprocess(pcd, o3d, obj_path: Path, ply_path, depth: int, density_threshold: float):
+    """
+    Ejecuta Poisson en un subprocess aislado para que un segfault de Open3D
+    no mate el proceso principal.
+    """
+    import sys, subprocess, tempfile, json, os
+
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
+        tmp_ply = tmp.name
+    o3d.io.write_point_cloud(tmp_ply, pcd)
+
+    args = json.dumps({
+        "ply_in": tmp_ply,
+        "obj_out": str(obj_path),
+        "ply_save": str(ply_path) if ply_path else "",
+        "depth": depth,
+        "density_threshold": density_threshold,
+    })
+
+    worker = Path(__file__).parent / "_poisson_worker.py"
+    result = subprocess.run(
+        [sys.executable, str(worker), args],
+        capture_output=True, text=True
+    )
+
+    for line in result.stdout.splitlines():
+        print(f"    {line}")
+
+    try:
+        os.unlink(tmp_ply)
+    except OSError:
+        pass
+
+    if result.returncode != 0:
+        print(f"    Error en reconstrucción (código {result.returncode})")
+        lines = [l for l in result.stderr.splitlines() if l.strip() and "[ERROR]" not in l]
+        if lines:
+            print(f"    {lines[-1]}")
 
 
 def segment_objects(
@@ -169,19 +220,14 @@ def segment_objects(
         print(f"\n  {label}: {len(cluster_pcd.points):,} puntos")
 
         if save_clusters:
-            ply_out = output_dir / f"{label}.ply"
-            o3d.io.write_point_cloud(str(ply_out), cluster_pcd)
-            print(f"    PLY guardado: {ply_out.name}")
+            ply_out_path = output_dir / f"{label}.ply"
+        else:
+            ply_out_path = None
 
         obj_path = output_dir / f"{label}.obj"
-        try:
-            mesh = reconstruct_mesh(cluster_pcd, o3d, depth=poisson_depth,
-                                    density_threshold=density_threshold)
-            print(f"    {len(mesh.triangles):,} triángulos")
-            mesh_to_obj(mesh, obj_path)
-            print(f"    OBJ guardado: {obj_path.name}")
-        except Exception as e:
-            print(f"    Error en reconstrucción: {e}")
+        _reconstruct_in_subprocess(
+            cluster_pcd, o3d, obj_path, ply_out_path, poisson_depth, density_threshold
+        )
 
     print(f"\nListo — {len(clusters)} OBJ(s) en {output_dir}")
 
