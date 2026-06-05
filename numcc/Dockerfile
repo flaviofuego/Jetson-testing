@@ -18,29 +18,27 @@ RUN pip install --no-cache-dir --upgrade pip setuptools wheel
 # ── 1. Clone P2C ──────────────────────────────────────────────────────────────
 RUN git clone https://github.com/CuiRuikai/Partial2Complete.git /opt/p2c
 
-# ── 2. Clone NU-MCC ───────────────────────────────────────────────────────────
+# ── 2. Build P2C CUDA extensions (chamfer_dist + pointops) ───────────────────
+RUN pip install --no-cache-dir /opt/p2c/extensions/chamfer_dist
+RUN pip install --no-cache-dir /opt/p2c/extensions/pointops
+
+# ── 3. Clone NU-MCC ───────────────────────────────────────────────────────────
 RUN git clone https://github.com/sail-sg/numcc.git /opt/numcc
 
-# ── 3. Python deps ────────────────────────────────────────────────────────────
+# ── 4. Python deps ────────────────────────────────────────────────────────────
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Install P2C deps best-effort (skip packages that conflict with Jetson torch)
-RUN if [ -f /opt/p2c/requirements.txt ]; then \
-      grep -v -E '^torch|^torchvision' /opt/p2c/requirements.txt \
-      | pip install --no-cache-dir -r /dev/stdin || true; \
-    fi
+# ── 5. pytorch3d — build from source (no ARM64 wheel available) ───────────────
+# pytorch3d is required by P2C (estimate_pointcloud_normals in ManifoldnessConstraint)
+RUN pip install --no-cache-dir \
+    'pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git' || \
+    echo "WARNING: pytorch3d build failed — ManifoldnessConstraint will not work"
 
-# Install NU-MCC deps best-effort
-RUN if [ -f /opt/numcc/requirements.txt ]; then \
-      grep -v -E '^torch|^torchvision' /opt/numcc/requirements.txt \
-      | pip install --no-cache-dir -r /dev/stdin || true; \
-    fi
-
-# ── 4. Pipeline modules ───────────────────────────────────────────────────────
+# ── 6. Pipeline modules ───────────────────────────────────────────────────────
 COPY pointcloud_utils.py mesh_utils.py sdf_generator.py pipeline.py /app/
 
-# ── 5. Runtime environment ────────────────────────────────────────────────────
+# ── 7. Runtime environment ────────────────────────────────────────────────────
 # Weights downloaded once on host: python tools/download_models_numcc.py
 # Mount at runtime: -v ~/models/numcc:/opt/models:ro
 ENV PYTHONPATH=/opt/p2c:/opt/numcc:/app

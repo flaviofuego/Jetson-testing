@@ -7,11 +7,23 @@ coacd>=1.0.0
 numpy>=1.24.0
 imageio>=2.34.0
 Pillow>=10.0.0
+opencv-python-headless>=4.8.0
 
-# Point cloud utils (used by P2C / NU-MCC internally)
+# Point cloud utils + meshing (open3d for Poisson reconstruction)
 plyfile>=0.7.4
+open3d>=0.17.0
 
 # Progress / config
 tqdm>=4.64.0
 easydict>=1.10
 omegaconf>=2.3.0
+pyyaml>=6.0
+
+# P2C deps
+timm==0.4.5
+h5py>=3.9.0
+transforms3d>=0.4.1
+
+# pytorch3d — install from source in Dockerfile (no ARM64 wheel available)
+# pytorch3d is needed by P2C (estimate_pointcloud_normals) and NU-MCC demo
+# See Dockerfile for build instructions.
