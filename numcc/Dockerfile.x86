@@ -1,0 +1,43 @@
+# x86 GPU (Linux, CUDA 11.8+)
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git g++ libgl1 libglib2.0-0 libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ── 1. Clone P2C ──────────────────────────────────────────────────────────────
+RUN git clone https://github.com/CuiRuikai/Partial2Complete.git /opt/p2c
+
+# ── 2. Clone NU-MCC ───────────────────────────────────────────────────────────
+RUN git clone https://github.com/sail-sg/numcc.git /opt/numcc
+
+# ── 3. Python deps ────────────────────────────────────────────────────────────
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Install P2C deps best-effort
+RUN if [ -f /opt/p2c/requirements.txt ]; then \
+      grep -v -E '^torch|^torchvision' /opt/p2c/requirements.txt \
+      | pip install --no-cache-dir -r /dev/stdin || true; \
+    fi
+
+# Install NU-MCC deps best-effort
+RUN if [ -f /opt/numcc/requirements.txt ]; then \
+      grep -v -E '^torch|^torchvision' /opt/numcc/requirements.txt \
+      | pip install --no-cache-dir -r /dev/stdin || true; \
+    fi
+
+# ── 4. Pipeline modules ───────────────────────────────────────────────────────
+COPY pointcloud_utils.py mesh_utils.py sdf_generator.py pipeline.py /app/
+
+# ── 5. Runtime environment ────────────────────────────────────────────────────
+# Weights downloaded once on host: python tools/download_models_numcc.py
+# Mount at runtime: -v ~/models/numcc:/opt/models:ro
+ENV PYTHONPATH=/opt/p2c:/opt/numcc:/app
+ENV PYTHONWARNINGS=ignore::FutureWarning,ignore::UserWarning
+
+ENTRYPOINT ["python3", "/app/pipeline.py"]
