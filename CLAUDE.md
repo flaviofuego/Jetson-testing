@@ -54,6 +54,7 @@ tools/
 | `triposr:cpu` | `triposr/Dockerfile.cpu` | `python:3.12-slim` | CPU cualquier máquina |
 | `trellis` | `trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU |
 | `dvlt:jetson` | `dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU |
+| `sam2:jetson` | `sam2/Dockerfile.jetson` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
 
 ## Comandos principales
 
