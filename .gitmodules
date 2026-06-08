@@ -1,3 +1,6 @@
 [submodule "dvlt.cu"]
 	path = dvlt.cu
 	url = https://github.com/flaviofuego/dvlt.cu
+[submodule "sam2"]
+	path = sam2
+	url = https://github.com/cristian10gf/sam2.git
