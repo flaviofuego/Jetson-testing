@@ -103,9 +103,10 @@ def run_numcc(
     weights_dir: Path,
     query_pts: np.ndarray | None = None,
     seen_mask: np.ndarray | None = None,
-    udf_threshold: float = 0.05,
+    udf_threshold: float = 0.23,
     n_query: int = 200_000,
     batch_size: int = 40_000,
+    n_iter: int = 3,
 ) -> np.ndarray:
     """Reconstruct surface point cloud with NU-MCC. Returns (N, 3) float32 numpy array.
 
@@ -126,13 +127,13 @@ def run_numcc(
     _sys.path.insert(0, "/opt/numcc")
 
     from src.model.nu_mcc import NUMCC
-    from src.fns import shrink_points_beyond_threshold, preprocess_img
+    from src.fns import shrink_points_beyond_threshold, preprocess_img, move_points
 
     XYZ_SIZE = 112  # must match checkpoint training resolution
 
     import argparse as _ap
     numcc_args = _ap.Namespace(
-        nneigh=45,
+        nneigh=4,              # training default (was 45 — wrong, changes attention distribution)
         shrink_threshold=10.0,
         xyz_size=XYZ_SIZE,
         xyz_size_hr=224,
@@ -140,12 +141,14 @@ def run_numcc(
         device="cuda",
         drop_path=0,
         n_groups=200,
-        nn_seen=3,
+        nn_seen=4,             # training default (was 3 — lowered to avoid OOM from -1)
         no_fine=0,
         regress_color=0,
         n_query_udf=batch_size,
         udf_threshold=udf_threshold,
-        udf_n_iter=3,
+        udf_n_iter=n_iter,
+        repulsive=1,           # enable repulsive force in move_points (training default)
+        distributed=False,
     )
 
     model = NUMCC(args=numcc_args)
@@ -233,30 +236,45 @@ def run_numcc(
     print(f"      seen_xyz valid: {valid_seen.sum().item()} / {XYZ_SIZE**2} px"
           + (" (depth+mask)" if seen_mask is not None else " (depth only)"))
 
-    # ── query grid in normalized coordinate space ─────────────────────────────
-    # Use 0.3 padding in normalized units (matches the ±0.3 offset the demo uses
-    # around anchor-predicted centers). Camera-frame query_pts were normalized above.
-    padding = 0.3
-    mins = query_pts.min(axis=0) - padding
-    maxs = query_pts.max(axis=0) + padding
-    n_side = int(np.cbrt(n_query))
-    xs = np.linspace(mins[0], maxs[0], n_side)
-    ys = np.linspace(mins[1], maxs[1], n_side)
-    zs = np.linspace(mins[2], maxs[2], n_side)
-    grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
-    query_xyz_t = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).cuda()  # (1, Q, 3)
-
-    # Encode once, decode in batches
+    # ── encode once ───────────────────────────────────────────────────────────
     with torch.no_grad():
         seen_images_proc = preprocess_img(seen_images.clone())
         seen_xyz_shrunk = shrink_points_beyond_threshold(seen_xyz_t, numcc_args.shrink_threshold)
-        query_xyz_shrunk = shrink_points_beyond_threshold(query_xyz_t, numcc_args.shrink_threshold)
 
         latent, up_grid_fea = model.encoder(seen_images_proc, seen_xyz_shrunk, valid_seen)
         fea = model.decoderl1(latent)
 
+    # ── query grid: anchored to model-predicted centers (demo_iphone.py approach) ──
+    # fea['anchors_xyz'] are the 200 anchor points the decoder predicts after l1.
+    # Using them (± offset) focuses the query grid where the model says the surface is,
+    # rather than relying on the depth bounding box which can be noisy.
+    centers_xyz = fea["anchors_xyz"]  # (1, 200, 3) in normalized space
+    offset = 0.3
+    c_min = centers_xyz[0].min(dim=0).values - offset  # (3,)
+    c_max = centers_xyz[0].max(dim=0).values + offset  # (3,)
+
+    # Widen to also cover the depth back-projection bounding box so we don't
+    # miss regions the depth sees but the anchors haven't centered on yet.
+    bb_min = torch.tensor(query_pts.min(axis=0) - offset, device="cuda")
+    bb_max = torch.tensor(query_pts.max(axis=0) + offset, device="cuda")
+    grid_min = torch.min(c_min, bb_min).cpu().numpy()
+    grid_max = torch.max(c_max, bb_max).cpu().numpy()
+
+    n_side = int(np.cbrt(n_query))
+    xs = np.linspace(grid_min[0], grid_max[0], n_side)
+    ys = np.linspace(grid_min[1], grid_max[1], n_side)
+    zs = np.linspace(grid_min[2], grid_max[2], n_side)
+    grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+    query_xyz_t = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).cuda()  # (1, Q, 3)
+    query_xyz_shrunk = shrink_points_beyond_threshold(query_xyz_t, numcc_args.shrink_threshold)
+    print(f"      query grid: {len(grid):,} pts  "
+          f"X=[{grid_min[0]:.2f},{grid_max[0]:.2f}]  "
+          f"Y=[{grid_min[1]:.2f},{grid_max[1]:.2f}]  "
+          f"Z=[{grid_min[2]:.2f},{grid_max[2]:.2f}]  (normalized)")
+
+    # ── pass 1: evaluate UDF on query grid, collect candidate points ─────────
     total_q = query_xyz_shrunk.shape[1]
-    surface_pts = []
+    candidate_batches = []
     all_udf_vals = []
     for start in range(0, total_q, batch_size):
         end = min(start + batch_size, total_q)
@@ -267,43 +285,81 @@ def run_numcc(
         udf = F.relu(pred[:, :, :1]).squeeze(-1)  # (1, Q_batch)
         all_udf_vals.append(udf[0].cpu())
         mask = udf[0] < udf_threshold
-        pts = q_batch[0][mask].cpu().numpy()
-        if len(pts) > 0:
-            surface_pts.append(pts)
+        if mask.sum() > 0:
+            candidate_batches.append(q_batch[0][mask])  # keep as tensor on GPU
 
     all_udf = torch.cat(all_udf_vals).numpy()
     print(f"      UDF stats: min={all_udf.min():.4f}  p5={np.percentile(all_udf,5):.4f}"
           f"  p25={np.percentile(all_udf,25):.4f}  median={np.median(all_udf):.4f}"
           f"  p75={np.percentile(all_udf,75):.4f}  max={all_udf.max():.4f}")
-    for t in [0.01, 0.03, 0.05, 0.10, 0.20]:
+    for t in [0.01, 0.03, 0.05, 0.10, 0.20, 0.30]:
         print(f"      UDF < {t:.2f}: {(all_udf < t).sum()} pts")
 
-    if not surface_pts:
-        # Fallback: return normalized seen_xyz points — mesh_utils.normalize_mesh
-        # rescales by longest axis anyway, so normalized coords are acceptable.
+    if not candidate_batches:
+        # Fallback: return normalized seen_xyz points
         valid = np.isfinite(xyz_map).all(-1)
         return xyz_map[valid]
+
+    # ── pass 2: move_points — gradient descent to snap candidates to surface ──
+    # Each point moves toward the zero-level set: x ← x - ∇UDF * UDF(x)
+    # Equivalent to what demo_iphone.py does per-batch before returning results.
+    refined = []
+    for cand in candidate_batches:
+        pts = cand.unsqueeze(0)  # (1, N, 3)
+        pts = move_points(model, pts, seen_xyz_shrunk, valid_seen, fea, up_grid_fea,
+                          numcc_args, n_iter=numcc_args.udf_n_iter)
+        refined.append(pts.detach().squeeze(0).cpu().numpy().astype(np.float32))
+
     # Surface points are in normalized space; normalize_mesh handles rescaling.
-    return np.concatenate(surface_pts, axis=0)
+    return np.concatenate(refined, axis=0)
 
 
-def _points_to_mesh(surface_pts: np.ndarray) -> "trimesh.Trimesh":
-    """Convert surface point cloud to mesh via Poisson reconstruction (open3d)."""
+def _points_to_mesh(surface_pts: np.ndarray, poisson_depth: int = 10) -> "trimesh.Trimesh":
+    """Convert surface point cloud to mesh via Poisson reconstruction (open3d).
+
+    poisson_depth controls octree depth — higher = finer mesh but slower:
+      9  → coarse  (~30K faces typical)
+      10 → medium  (~100K faces typical)  [default]
+      11 → fine    (~300K faces typical)
+    """
     import trimesh
     try:
         import open3d as o3d
+
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(surface_pts)
-        pcd.estimate_normals(search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.01, max_nn=30))
-        mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(pcd, depth=9)
-        # Remove low-density vertices (artifacts at mesh boundary)
-        threshold = np.quantile(np.asarray(densities), 0.05)
+
+        # Adaptive normal estimation: radius = 5× median nearest-neighbour distance.
+        # Avoids under/over-smoothing when points are not uniformly distributed.
+        nn_dists = np.sort(
+            np.linalg.norm(surface_pts[None] - surface_pts[:, None], axis=-1), axis=1
+        )[:, 1] if len(surface_pts) < 5000 else None  # skip brute-force for large clouds
+
+        if nn_dists is not None:
+            radius = float(np.median(nn_dists)) * 5.0
+        else:
+            # Estimate from point cloud extent
+            extent = surface_pts.max(axis=0) - surface_pts.min(axis=0)
+            density = len(surface_pts) / max(np.prod(extent), 1e-6)
+            radius = float((1.0 / density) ** (1 / 3)) * 3.0
+
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=50)
+        )
+        pcd.orient_normals_consistent_tangent_plane(30)
+
+        mesh_o3d, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+            pcd, depth=poisson_depth
+        )
+        # Remove low-density boundary artifacts (bottom 2% — conservative to keep surface)
+        threshold = np.quantile(np.asarray(densities), 0.02)
         mesh_o3d.remove_vertices_by_mask(np.asarray(densities) < threshold)
+        mesh_o3d.remove_degenerate_triangles()
+        mesh_o3d.remove_duplicated_vertices()
         verts = np.asarray(mesh_o3d.vertices)
         faces = np.asarray(mesh_o3d.triangles)
         return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
     except Exception:
-        # open3d unavailable — fall back to convex hull of surface points
         return trimesh.PointCloud(surface_pts).convex_hull
 
 
@@ -383,8 +439,17 @@ def main():
     parser.add_argument("--no-p2c",    action="store_true",
                         help="Skip P2C completion — use raw (mask-filtered) depth cloud directly. "
                              "Recommended when P2C checkpoint coordinate system differs from camera frame.")
-    parser.add_argument("--udf-threshold", default=0.05, type=float,
-                        help="NU-MCC UDF threshold for surface extraction (default: 0.05)")
+    parser.add_argument("--udf-threshold", default=0.23, type=float,
+                        help="NU-MCC UDF threshold for surface extraction (default: 0.23, "
+                             "matches CO3D-V2 training). Candidates below this distance are "
+                             "then refined with move_points gradient descent.")
+    parser.add_argument("--udf-n-iter", default=3, type=int,
+                        help="move_points gradient-descent iterations (default: 3, more→better surface)")
+    parser.add_argument("--n-query", default=200_000, type=int,
+                        help="Query grid points for UDF evaluation (default: 200000, "
+                             "n_side=cbrt(n_query) per axis). More→denser surface coverage.")
+    parser.add_argument("--poisson-depth", default=10, type=int,
+                        help="Poisson reconstruction octree depth (default: 10; 9=coarse, 11=fine)")
     args = parser.parse_args()
 
     if args.intrinsics is None and any(v is None for v in [args.fx, args.fy, args.cx, args.cy]):
@@ -484,12 +549,18 @@ def main():
                             query_pts=query_pts,
                             seen_mask=seen_mask,
                             udf_threshold=args.udf_threshold,
-                            n_query=50_000,
-                            batch_size=4_000)
+                            n_query=args.n_query,
+                            batch_size=6_000,
+                            n_iter=args.udf_n_iter)
     print(f"      {len(surface_pts)} surface points")
 
+    # Save PLY of raw NU-MCC surface output (normalized space, before meshing)
+    numcc_ply = asset_dir / f"{args.name}_numcc_surface.ply"
+    _save_ply(numcc_ply, surface_pts)
+    print(f"      PLY saved: {numcc_ply}")
+
     print("[4b/6] Meshing surface points (Poisson reconstruction)...")
-    raw_mesh = _points_to_mesh(surface_pts)
+    raw_mesh = _points_to_mesh(surface_pts, poisson_depth=args.poisson_depth)
     print(f"       Raw mesh: {len(raw_mesh.faces)} faces")
 
     print("[5/6] Normalizing mesh (longest axis -> 20 cm)...")
@@ -520,6 +591,8 @@ def main():
     print(f"\nDone -> {asset_dir}/  ({time.time() - t_start:.1f}s total)")
     print(f"  {args.name}.obj")
     print(f"  {args.name}.sdf")
+    print(f"  {args.name}_numcc_surface.ply  ← raw NU-MCC output (normalized space)")
+    print(f"  {args.name}_object_cloud.ply   ← depth back-projection (metric space)")
     print(f"  {args.name}_pointcloud.npy")
     print(f"  {args.name}_parts/")
 

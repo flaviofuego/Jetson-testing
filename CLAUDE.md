@@ -182,19 +182,24 @@ docker run --rm --gpus all \
 
 **Nota sobre el checkpoint P2C:** el archivo descargado (`p2c_checkpoint.pth`) es un ZIP con checkpoints por categoría ShapeNet (plane/car/chair/lamp/sofa/table/watercraft/cabinet). No corresponde a la arquitectura P2C de CuiRuikai. El pipeline tiene fallback gracioso — si `load_state_dict` falla, pasa la nube de depth directamente a NU-MCC sin completar.
 
-**Parámetros reales del checkpoint NU-MCC (udf-ep99.pth, CO3D-V2):**
+**Parámetros correctos del checkpoint NU-MCC (udf-ep99.pth, CO3D-V2):**
 - `n_groups=200` (shape de init_embedding en el checkpoint)
-- `nn_seen=3` (con -1 → OOM de 95 GiB)
-- `seen_xyz`: mapa XYZ 2D `(B, 112, 112, 3)` normalizado a zero-mean/unit-std antes de pasarse al modelo; píxeles inválidos = `float('inf')`
+- `nneigh=4` — vecinos de anclaje que el decoder atiende (training default; usar 45 rompe la distribución de atención)
+- `nn_seen=4` — vecinos de seen_xyz por query point (training default; -1 → OOM de 95 GiB)
+- `udf_threshold=0.23` — threshold de training (0.05 descartaba casi todos los puntos válidos; con 0.23 se obtienen ~10K candidatos)
+- `repulsive=1` — fuerzas repulsivas activas en `move_points`
+- `seen_xyz`: mapa XYZ 2D `(B, 112, 112, 3)` normalizado a zero-mean/unit-std; inválidos = `float('inf')`
 - `seen_images`: 800×800 obligatorio (assert en preprocess_img); canal alpha eliminado si RGBA
-- Normalización de seen_xyz: stats computadas sobre píxeles de objeto únicamente (máscara aplicada antes de normalizar, no después)
+- Normalización de seen_xyz: stats computadas sobre píxeles de objeto únicamente (máscara aplicada antes de normalizar)
 
-**UDF threshold para depth monocular:** usar `--udf-threshold 0.10` (default 0.05 es demasiado estricto con una sola imagen). Con 0.10 se obtienen ~1000–1500 puntos de superficie vs. ~50 con 0.05.
+**`move_points` es crítico:** después del filtro por UDF threshold, cada punto candidato se refina por descenso de gradiente sobre el campo UDF (`udf_n_iter=3` iteraciones). Sin esto la superficie es muy escasa e irregular.
 
 **Outputs en `assets/<nombre>/`:**
-- `<nombre>.obj` — mesh Poisson (~5–7 K caras con imagen única; ~57 K con RGBD denso)
+- `<nombre>.obj` — mesh Poisson (~30 K caras con imagen única y parámetros correctos)
 - `<nombre>.sdf` — listo para Drake
-- `<nombre>_pointcloud.npy` — nube de puntos completada
+- `<nombre>_numcc_surface.ply` — nube bruta de NU-MCC (espacio normalizado, antes del mesh)
+- `<nombre>_object_cloud.ply` — back-projection del depth (espacio métrico, antes de NU-MCC)
+- `<nombre>_pointcloud.npy` — nube de puntos P2C completada
 - `<nombre>_parts/` — piezas CoACD
 
 **Tiempo típico (RTX 4000 Ada, 20 GB):** ~20–28s
