@@ -72,12 +72,21 @@ def run_p2c(partial_pts: np.ndarray, weights_dir: Path) -> np.ndarray:
     })
 
     model = P2C(config)
-    ckpt = torch.load(str(weights_dir / "p2c_checkpoint.pth"), map_location="cuda")
+    ckpt_path = weights_dir / "p2c_checkpoint.pth"
+    ckpt = torch.load(str(ckpt_path), map_location="cuda")
     # P2C checkpoints may be saved as {'model': state_dict} or directly as state_dict
     state = ckpt.get("model", ckpt)
     if isinstance(state, dict) and "base_model" in state:
         state = state["base_model"]
-    model.load_state_dict(state)
+    # Strip DataParallel 'module.' prefix if present
+    if isinstance(state, dict) and all(k.startswith("module.") for k in state):
+        state = {k[len("module."):]: v for k, v in state.items()}
+    try:
+        model.load_state_dict(state)
+    except RuntimeError as e:
+        print(f"      WARNING: P2C checkpoint architecture mismatch ({e}). "
+              "Returning input points unchanged — NU-MCC will use raw depth cloud.")
+        return partial_pts
     model.eval().cuda()
 
     with torch.no_grad():
@@ -89,23 +98,27 @@ def run_p2c(partial_pts: np.ndarray, weights_dir: Path) -> np.ndarray:
 
 def run_numcc(
     color: np.ndarray,
-    seen_xyz: np.ndarray,
+    depth: np.ndarray,
+    fx: float, fy: float, cx: float, cy: float,
     weights_dir: Path,
-    udf_threshold: float = 0.03,
+    query_pts: np.ndarray | None = None,
+    seen_mask: np.ndarray | None = None,
+    udf_threshold: float = 0.05,
     n_query: int = 200_000,
     batch_size: int = 40_000,
 ) -> np.ndarray:
     """Reconstruct surface point cloud with NU-MCC. Returns (N, 3) float32 numpy array.
 
-    NU-MCC API (github.com/sail-sg/numcc):
-      - Model class: NUMCC in src/model/nu_mcc.py
-      - Input: seen_images (B,3,H,W), seen_xyz (B,N,3), query_xyz (B,Q,3), valid_seen_xyz (B,N)
-      - Output: UDF predictions at query_xyz — find surface where UDF < threshold
-      - Checkpoint loaded via misc.load_model or direct state_dict.
+    NU-MCC expects:
+      seen_images:    (B, 3, 800, 800) — RGB image (preprocess_img downscales to 224)
+      seen_xyz:       (B, H, W, 3)     — per-pixel XYZ map at xyz_size resolution (112×112)
+      valid_seen_xyz: (B, H, W)        — True where depth > 0 AND in SAM2 object mask
+      query_xyz:      (B, Q, 3)        — 3D positions to evaluate UDF
 
-    The P2C completed point cloud is used as seen_xyz to give NU-MCC full object coverage.
-    A 3D query grid is generated around the point cloud bounding box.
-    Surface points are extracted where predicted UDF < udf_threshold.
+    seen_mask: optional (H, W) uint8 array at ORIGINAL depth resolution.
+        If provided, valid_seen_xyz is further restricted to object pixels only,
+        so the encoder sees only the object surface — not the background scene.
+        This matches the CO3D-V2 training distribution better.
     """
     import torch
     import torch.nn.functional as F
@@ -115,16 +128,21 @@ def run_numcc(
     from src.model.nu_mcc import NUMCC
     from src.fns import shrink_points_beyond_threshold, preprocess_img
 
-    # Args namespace matching NU-MCC's expected parameters.
-    # Adjust nneigh/shrink_threshold/xyz_size to match your checkpoint's training config.
+    XYZ_SIZE = 112  # must match checkpoint training resolution
+
     import argparse as _ap
     numcc_args = _ap.Namespace(
         nneigh=45,
         shrink_threshold=10.0,
-        xyz_size=112,
+        xyz_size=XYZ_SIZE,
         xyz_size_hr=224,
         hr=0,
         device="cuda",
+        drop_path=0,
+        n_groups=200,
+        nn_seen=3,
+        no_fine=0,
+        regress_color=0,
         n_query_udf=batch_size,
         udf_threshold=udf_threshold,
         udf_n_iter=3,
@@ -136,21 +154,61 @@ def run_numcc(
     model.load_state_dict(state)
     model.eval().cuda()
 
-    # Prepare seen_images: (1, 3, H, W) float32 in [0, 1]
+    # ── seen_images: resize to 800×800 (preprocess_img assertion) ────────────
     if color.dtype == np.uint8:
         color_f = color.astype(np.float32) / 255.0
     else:
         color_f = color.astype(np.float32)
     seen_images = torch.from_numpy(color_f.transpose(2, 0, 1)).float().unsqueeze(0).cuda()
+    if seen_images.shape[2] != 800 or seen_images.shape[3] != 800:
+        seen_images = F.interpolate(seen_images, size=(800, 800), mode="bilinear", align_corners=False)
 
-    # Prepare seen_xyz: (1, N, 3), valid mask: (1, N)
-    seen_xyz_t = torch.from_numpy(seen_xyz).float().unsqueeze(0).cuda()
-    valid_seen = (seen_xyz_t.abs().sum(-1) > 0)  # (1, N) — all provided points are valid
+    # ── seen_xyz: (1, 112, 112, 3) — per-pixel XYZ map from depth ────────────
+    H_orig, W_orig = depth.shape
+    # Nearest-neighbour preserves valid/invalid boundaries without introducing
+    # spurious near-zero values at the edge between object and background.
+    depth_t = torch.from_numpy(depth).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    depth_small = F.interpolate(depth_t, size=(XYZ_SIZE, XYZ_SIZE), mode="nearest")
+    depth_small = depth_small.squeeze().numpy()  # (112, 112)
 
-    # Generate 3D query grid around the bounding box of seen points
-    padding = 0.05  # 5 cm beyond the object extent
-    mins = seen_xyz.min(axis=0) - padding
-    maxs = seen_xyz.max(axis=0) + padding
+    # Scale intrinsics to the downsampled resolution
+    scale_x = XYZ_SIZE / W_orig
+    scale_y = XYZ_SIZE / H_orig
+    fx_s, fy_s = fx * scale_x, fy * scale_y
+    cx_s, cy_s = cx * scale_x, cy * scale_y
+
+    v_idx, u_idx = np.mgrid[0:XYZ_SIZE, 0:XYZ_SIZE]
+    Z = depth_small
+    X = (u_idx - cx_s) * Z / fx_s
+    Y = (v_idx - cy_s) * Z / fy_s
+    xyz_map = np.stack([X, Y, Z], axis=-1).astype(np.float32)  # (112, 112, 3)
+    xyz_map[Z == 0] = np.nan  # mark invalid (no depth)
+
+    seen_xyz_t = torch.from_numpy(xyz_map).unsqueeze(0).cuda()  # (1, 112, 112, 3)
+    valid_seen = torch.isfinite(seen_xyz_t.sum(-1))             # (1, 112, 112) — depth > 0
+
+    # Restrict valid observations to object pixels via SAM2 mask.
+    # This prevents the background scene from interfering with the encoder
+    # and matches the single-object training distribution of CO3D-V2.
+    if seen_mask is not None:
+        from PIL import Image as PILImage
+        m_img = PILImage.fromarray(seen_mask.astype(np.uint8) * 255).resize(
+            (XYZ_SIZE, XYZ_SIZE), PILImage.NEAREST
+        )
+        mask_small = torch.from_numpy(np.asarray(m_img) > 0).unsqueeze(0).cuda()
+        valid_seen = valid_seen & mask_small
+        print(f"      seen_xyz valid: {valid_seen.sum().item()} / {XYZ_SIZE**2} px (mask-filtered)")
+    else:
+        print(f"      seen_xyz valid: {valid_seen.sum().item()} / {XYZ_SIZE**2} px")
+
+    seen_xyz_t[~valid_seen] = -100.0
+
+    # ── query grid: build around point cloud bounding box ────────────────────
+    if query_pts is None:
+        query_pts = xyz_map[np.isfinite(xyz_map).all(-1)]
+    padding = 0.05
+    mins = query_pts.min(axis=0) - padding
+    maxs = query_pts.max(axis=0) + padding
     n_side = int(np.cbrt(n_query))
     xs = np.linspace(mins[0], maxs[0], n_side)
     ys = np.linspace(mins[1], maxs[1], n_side)
@@ -158,7 +216,7 @@ def run_numcc(
     grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
     query_xyz_t = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).cuda()  # (1, Q, 3)
 
-    # Encode once, decode in batches (NU-MCC query batching pattern from demo)
+    # Encode once, decode in batches
     with torch.no_grad():
         seen_images_proc = preprocess_img(seen_images.clone())
         seen_xyz_shrunk = shrink_points_beyond_threshold(seen_xyz_t, numcc_args.shrink_threshold)
@@ -169,6 +227,7 @@ def run_numcc(
 
     total_q = query_xyz_shrunk.shape[1]
     surface_pts = []
+    all_udf_vals = []
     for start in range(0, total_q, batch_size):
         end = min(start + batch_size, total_q)
         q_batch = query_xyz_shrunk[:, start:end]
@@ -176,14 +235,22 @@ def run_numcc(
             pred = model.decoderl2(q_batch, seen_xyz_shrunk, valid_seen, fea, up_grid_fea)
             pred = model.fc_out(pred)
         udf = F.relu(pred[:, :, :1]).squeeze(-1)  # (1, Q_batch)
+        all_udf_vals.append(udf[0].cpu())
         mask = udf[0] < udf_threshold
         pts = q_batch[0][mask].cpu().numpy()
         if len(pts) > 0:
             surface_pts.append(pts)
 
+    all_udf = torch.cat(all_udf_vals).numpy()
+    print(f"      UDF stats: min={all_udf.min():.4f}  p5={np.percentile(all_udf,5):.4f}"
+          f"  p25={np.percentile(all_udf,25):.4f}  median={np.median(all_udf):.4f}"
+          f"  p75={np.percentile(all_udf,75):.4f}  max={all_udf.max():.4f}")
+    for t in [0.01, 0.03, 0.05, 0.10, 0.20]:
+        print(f"      UDF < {t:.2f}: {(all_udf < t).sum()} pts")
+
     if not surface_pts:
-        # No surface found — return original seen_xyz as fallback
-        return seen_xyz
+        valid = np.isfinite(xyz_map).all(-1)
+        return xyz_map[valid]
     return np.concatenate(surface_pts, axis=0)
 
 
@@ -207,12 +274,68 @@ def _points_to_mesh(surface_pts: np.ndarray) -> "trimesh.Trimesh":
         return trimesh.PointCloud(surface_pts).convex_hull
 
 
+def _save_ply(path: Path, pts: np.ndarray, colors: np.ndarray | None = None):
+    """Write binary little-endian PLY. pts: (N,3) float32, colors: (N,3) uint8."""
+    N = len(pts)
+    has_color = colors is not None and len(colors) == N
+    dt = [("x", "f4"), ("y", "f4"), ("z", "f4")]
+    if has_color:
+        dt += [("red", "u1"), ("green", "u1"), ("blue", "u1")]
+    data = np.zeros(N, dtype=dt)
+    data["x"], data["y"], data["z"] = pts[:, 0], pts[:, 1], pts[:, 2]
+    if has_color:
+        data["red"], data["green"], data["blue"] = colors[:, 0], colors[:, 1], colors[:, 2]
+    prop_lines = "property float x\nproperty float y\nproperty float z\n"
+    if has_color:
+        prop_lines += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+    header = (
+        f"ply\nformat binary_little_endian 1.0\n"
+        f"element vertex {N}\n"
+        f"{prop_lines}end_header\n"
+    )
+    with open(path, "wb") as f:
+        f.write(header.encode("ascii"))
+        f.write(data.tobytes())
+
+
+def _apply_mask_to_pointcloud(
+    all_pts: np.ndarray, depth: np.ndarray, mask_path: Path
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Filter back-projected points to only those inside the SAM2 segmask.
+
+    Returns (filtered_pts, v_indices, u_indices) so callers can sample colors
+    from the color image at the corresponding pixel locations.
+    """
+    mask = np.load(str(mask_path)).astype(bool)
+    H, W = depth.shape
+    if mask.shape != (H, W):
+        from PIL import Image as PILImage
+        m_img = PILImage.fromarray(mask.astype(np.uint8) * 255).resize(
+            (W, H), PILImage.NEAREST
+        )
+        mask = np.asarray(m_img) > 0
+
+    v_valid, u_valid = np.where(depth > 0)
+    in_object = mask[v_valid, u_valid]
+    filtered_pts = all_pts[in_object]
+    v_obj = v_valid[in_object]
+    u_obj = u_valid[in_object]
+    print(f"      Mask filter: {len(all_pts)} → {len(filtered_pts)} object pts")
+    return filtered_pts, v_obj, u_obj
+
+
 def main():
-    parser = argparse.ArgumentParser(description="P2C + NU-MCC asset generation pipeline")
+    parser = argparse.ArgumentParser(description="NU-MCC asset generation pipeline")
     parser.add_argument("--depth",      required=True, type=Path,
-                        help="Depth file (.npy float32 meters or .png uint16 mm)")
+                        help="Full (unmasked) depth file (.npy float32 meters or .png uint16 mm). "
+                             "Used as-is for seen_xyz fed to NU-MCC.")
     parser.add_argument("--color",      default=None,  type=Path,
                         help="Color file (.npy uint8 or .png). Required for best NU-MCC quality.")
+    parser.add_argument("--mask",       default=None,  type=Path,
+                        help="SAM2 binary mask .npy (H×W uint8, 1=object). "
+                             "Filters the back-projected point cloud to object pixels only. "
+                             "Does NOT alter seen_xyz — full depth is always passed to NU-MCC.")
     parser.add_argument("--intrinsics", default=None,  type=Path,
                         help="intrinsics.json with fx/fy/cx/cy")
     parser.add_argument("--fx",         default=None,  type=float)
@@ -222,11 +345,12 @@ def main():
     parser.add_argument("--name",       required=True, type=str)
     parser.add_argument("--output",     required=True, type=Path)
     parser.add_argument("--n-input",    default=2048,  type=int,
-                        help="Points sampled from depth map for P2C input")
-    parser.add_argument("--n-output",   default=16384, type=int,
-                        help="Target points in P2C completion output (unused — P2C outputs n_points from config)")
-    parser.add_argument("--udf-threshold", default=0.03, type=float,
-                        help="NU-MCC UDF threshold for surface extraction (default: 0.03)")
+                        help="Object points sampled for P2C / query-grid bounding box")
+    parser.add_argument("--no-p2c",    action="store_true",
+                        help="Skip P2C completion — use raw (mask-filtered) depth cloud directly. "
+                             "Recommended when P2C checkpoint coordinate system differs from camera frame.")
+    parser.add_argument("--udf-threshold", default=0.05, type=float,
+                        help="NU-MCC UDF threshold for surface extraction (default: 0.05)")
     args = parser.parse_args()
 
     if args.intrinsics is None and any(v is None for v in [args.fx, args.fy, args.cx, args.cy]):
@@ -239,28 +363,95 @@ def main():
 
     t_start = time.time()
 
+    # ── [1] Load full (unmasked) depth + color ────────────────────────────────
     print(f"[1/6] Loading depth: {args.depth}")
-    depth = load_depth(args.depth)
+    depth = load_depth(args.depth)          # full scene, no masking applied here
     color = _load_color(args.color, depth)
+    print(f"      depth shape={depth.shape}  valid_px={int((depth > 0).sum())}  "
+          f"range=[{depth[depth>0].min():.3f}, {depth[depth>0].max():.3f}] m")
 
-    print("[2/6] Back-projecting depth -> partial point cloud...")
+    # ── [2] Back-project full depth → 3D cloud, then filter by SAM2 mask ─────
+    print("[2/6] Back-projecting depth -> point cloud (full scene, then mask-filter)...")
     if args.intrinsics:
         fx, fy, cx, cy = load_intrinsics(args.intrinsics)
     else:
         fx, fy, cx, cy = args.fx, args.fy, args.cx, args.cy
+    print(f"      intrinsics: fx={fx:.1f} fy={fy:.1f} cx={cx:.1f} cy={cy:.1f}")
+
     all_pts = depth_to_pointcloud(depth, fx=fx, fy=fy, cx=cx, cy=cy)
-    partial_pts = subsample_pointcloud(all_pts, n=args.n_input)
-    print(f"      {len(all_pts)} valid pixels -> {len(partial_pts)} sampled points")
+    print(f"      full scene: {len(all_pts)} pts  "
+          f"X=[{all_pts[:,0].min():.3f},{all_pts[:,0].max():.3f}]  "
+          f"Y=[{all_pts[:,1].min():.3f},{all_pts[:,1].max():.3f}]  "
+          f"Z=[{all_pts[:,2].min():.3f},{all_pts[:,2].max():.3f}] m")
 
-    print(f"[3/6] P2C: completing point cloud (~{args.n_input} -> 2048 pts)...")
-    completed_pts = run_p2c(partial_pts, weights_dir=models_root / "p2c")
-    pc_path = asset_dir / f"{args.name}_pointcloud.npy"
-    np.save(str(pc_path), completed_pts)
-    print(f"      {len(completed_pts)} points -> saved {pc_path}")
+    if args.mask is not None:
+        object_pts, v_obj, u_obj = _apply_mask_to_pointcloud(all_pts, depth, args.mask)
+    else:
+        object_pts = all_pts
+        v_obj, u_obj = np.where(depth > 0)  # all valid pixels
+        print("      (no mask — using full point cloud)")
 
-    print("[4/6] NU-MCC: reconstructing surface from RGB + point cloud...")
-    surface_pts = run_numcc(color, completed_pts, weights_dir=models_root / "numcc",
-                            udf_threshold=args.udf_threshold)
+    if len(object_pts) == 0:
+        raise RuntimeError("No object points after mask filter. Check mask alignment.")
+
+    # Sample RGB colors from the color image at the object pixel locations.
+    # color may differ in resolution from depth — scale indices accordingly.
+    color_H, color_W = color.shape[:2]
+    depth_H, depth_W = depth.shape
+    cv = (v_obj * (color_H / depth_H)).astype(int).clip(0, color_H - 1)
+    cu = (u_obj * (color_W / depth_W)).astype(int).clip(0, color_W - 1)
+    object_colors = color[cv, cu, :3].astype(np.uint8)  # (N, 3)
+
+    # Save PLY of the SAM2-filtered object point cloud (all points, before subsampling)
+    ply_path = asset_dir / f"{args.name}_object_cloud.ply"
+    _save_ply(ply_path, object_pts, object_colors)
+    print(f"      PLY saved: {ply_path}  ({len(object_pts)} pts, RGB)")
+
+    partial_pts = subsample_pointcloud(object_pts, n=args.n_input)
+    print(f"      object cloud: {len(object_pts)} pts -> {len(partial_pts)} subsampled  "
+          f"X=[{partial_pts[:,0].min():.3f},{partial_pts[:,0].max():.3f}]  "
+          f"Y=[{partial_pts[:,1].min():.3f},{partial_pts[:,1].max():.3f}]  "
+          f"Z=[{partial_pts[:,2].min():.3f},{partial_pts[:,2].max():.3f}] m")
+
+    # ── [3] Optional P2C completion ───────────────────────────────────────────
+    if args.no_p2c:
+        print("[3/6] P2C: SKIPPED (--no-p2c). Using mask-filtered depth cloud.")
+        query_pts = partial_pts   # camera frame — correct for NU-MCC query grid
+    else:
+        print(f"[3/6] P2C: completing point cloud (~{args.n_input} -> 2048 pts)...")
+        completed_pts = run_p2c(partial_pts, weights_dir=models_root / "p2c")
+        print(f"      {len(completed_pts)} pts  "
+              f"Z=[{completed_pts[:,2].min():.3f},{completed_pts[:,2].max():.3f}] m  "
+              f"(negative Z → P2C re-centered; will use partial_pts for query grid)")
+        # P2C re-centers the cloud to origin — incompatible coordinate system with seen_xyz.
+        # Always use camera-frame partial_pts for the query grid bounding box.
+        query_pts = partial_pts
+        completed_pts_path = asset_dir / f"{args.name}_pointcloud.npy"
+        np.save(str(completed_pts_path), completed_pts)
+        print(f"      Saved P2C output: {completed_pts_path}")
+
+    # ── [4] NU-MCC ────────────────────────────────────────────────────────────
+    # Load the SAM2 mask (uint8, depth resolution) to restrict valid_seen in NU-MCC.
+    seen_mask = None
+    if args.mask is not None:
+        seen_mask = np.load(str(args.mask)).astype(np.uint8)
+        H_d, W_d = depth.shape
+        if seen_mask.shape != (H_d, W_d):
+            from PIL import Image as PILImage
+            m_img = PILImage.fromarray(seen_mask * 255).resize((W_d, H_d), PILImage.NEAREST)
+            seen_mask = (np.asarray(m_img) > 0).astype(np.uint8)
+
+    print("[4/6] NU-MCC: reconstructing surface from RGB + depth XYZ map...")
+    print(f"      seen_xyz source: full depth ({depth.shape}), {int((depth>0).sum())} valid px")
+    print(f"      seen_mask: {'yes (object pixels only)' if seen_mask is not None else 'no (full scene)'}")
+    print(f"      query grid anchor: {len(query_pts)} object pts (camera frame)")
+    surface_pts = run_numcc(color, depth, fx, fy, cx, cy,
+                            weights_dir=models_root / "numcc",
+                            query_pts=query_pts,
+                            seen_mask=seen_mask,
+                            udf_threshold=args.udf_threshold,
+                            n_query=50_000,
+                            batch_size=4_000)
     print(f"      {len(surface_pts)} surface points")
 
     print("[4b/6] Meshing surface points (Poisson reconstruction)...")

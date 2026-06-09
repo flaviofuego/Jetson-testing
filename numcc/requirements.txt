@@ -4,7 +4,7 @@ scipy>=1.11.0
 coacd>=1.0.0
 
 # Image / array I/O
-numpy>=1.24.0
+numpy>=1.24.0,<2.0
 imageio>=2.34.0
 Pillow>=10.0.0
 opencv-python-headless>=4.8.0

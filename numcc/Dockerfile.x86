@@ -1,20 +1,28 @@
 # x86 GPU (Linux, CUDA 11.8+)
-FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+# devel image includes nvcc + CUDA headers needed to compile C++/CUDA extensions
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake git g++ ninja-build libgl1 libglib2.0-0 libgomp1 \
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    cmake git g++ ninja-build libgl1 libglib2.0-0 libgomp1 tzdata \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+# Upgrade pip only — do NOT upgrade setuptools, torch 2.1 needs the conda
+# setuptools that bundles pkg_resources (newer setuptools breaks cpp_extension).
+RUN pip install --no-cache-dir --upgrade pip
 
 # ── 1. Clone P2C ──────────────────────────────────────────────────────────────
 RUN git clone https://github.com/CuiRuikai/Partial2Complete.git /opt/p2c
 
-# ── 2. Build P2C CUDA extensions (chamfer_dist + pointops) ───────────────────
-RUN pip install --no-cache-dir /opt/p2c/extensions/chamfer_dist
-RUN pip install --no-cache-dir /opt/p2c/extensions/pointops
+# ── 2. Build P2C CUDA extensions via setup.py ────────────────────────────────
+# TORCH_CUDA_ARCH_LIST must be set — torch 2.1 _get_cuda_arch_flags crashes
+# with IndexError if the list is empty (no GPU detected at build time).
+# 7.5=Turing, 8.0/8.6=Ampere, 8.9=Ada Lovelace (RTX 4000 Ada)
+ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"
+RUN cd /opt/p2c/extensions/chamfer_dist && python setup.py install
+RUN cd /opt/p2c/extensions/pointops    && python setup.py install
 
 # ── 3. Clone NU-MCC ───────────────────────────────────────────────────────────
 RUN git clone https://github.com/sail-sg/numcc.git /opt/numcc
