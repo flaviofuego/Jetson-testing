@@ -149,18 +149,26 @@ python3 tools/download_models_numcc.py
 # Construir imagen Docker (una sola vez, ~10 min)
 docker build -t numcc:x86 -f numcc/Dockerfile.x86 numcc/
 
-# Generar asset desde depth map
+# Generar asset desde depth map (via generate_asset.py — sin soporte --mask)
 python3 tools/generate_asset.py --model numcc \
     --depth data/depth.npy \
     --color data/color.npy \
     --intrinsics data/intrinsics.json \
     --name nombre_objeto
 
-# Con intrínsecas directas (sin archivo JSON)
-python3 tools/generate_asset.py --model numcc \
-    --depth data/depth.npy \
-    --name objeto \
-    --fx 579.4 --fy 579.4 --cx 319.5 --cy 239.5
+# Correr directamente via Docker (soporta --mask para máscara SAM2)
+docker run --rm --gpus all \
+    -v ~/models/numcc:/opt/models:ro \
+    -v "$(pwd)/data/outputs/pipeline/nombre/numcc_input":/input:ro \
+    -v "$(pwd)/assets":/output \
+    numcc:x86 \
+    --depth /input/depth_full.npy \
+    --color /input/nombre_masked.png \
+    --mask  /input/mask.npy \
+    --intrinsics /input/intrinsics.json \
+    --name nombre_objeto \
+    --output /output/nombre_objeto \
+    --udf-threshold 0.10
 ```
 
 **Formatos aceptados:**
@@ -170,21 +178,54 @@ python3 tools/generate_asset.py --model numcc \
 
 **Intrínsecas de la cámara Drake (AIRA):** fx=fy=579.41, cx=319.5, cy=239.5 (imagen 640×480, FOV 45°)
 
+**Mount de modelos:** el pipeline espera `/opt/models` dentro del container — montar como `~/models/numcc:/opt/models:ro`. El `generate_asset.py` ya lo hace; si se corre Docker manualmente usar exactamente esa ruta.
+
 **Nota sobre el checkpoint P2C:** el archivo descargado (`p2c_checkpoint.pth`) es un ZIP con checkpoints por categoría ShapeNet (plane/car/chair/lamp/sofa/table/watercraft/cabinet). No corresponde a la arquitectura P2C de CuiRuikai. El pipeline tiene fallback gracioso — si `load_state_dict` falla, pasa la nube de depth directamente a NU-MCC sin completar.
 
 **Parámetros reales del checkpoint NU-MCC (udf-ep99.pth, CO3D-V2):**
 - `n_groups=200` (shape de init_embedding en el checkpoint)
 - `nn_seen=3` (con -1 → OOM de 95 GiB)
-- `seen_xyz`: mapa XYZ 2D `(B, 112, 112, 3)` del depth back-proyectado, NO nube plana
-- `seen_images`: 800×800 obligatorio (assert en preprocess_img)
+- `seen_xyz`: mapa XYZ 2D `(B, 112, 112, 3)` normalizado a zero-mean/unit-std antes de pasarse al modelo; píxeles inválidos = `float('inf')`
+- `seen_images`: 800×800 obligatorio (assert en preprocess_img); canal alpha eliminado si RGBA
+- Normalización de seen_xyz: stats computadas sobre píxeles de objeto únicamente (máscara aplicada antes de normalizar, no después)
+
+**UDF threshold para depth monocular:** usar `--udf-threshold 0.10` (default 0.05 es demasiado estricto con una sola imagen). Con 0.10 se obtienen ~1000–1500 puntos de superficie vs. ~50 con 0.05.
 
 **Outputs en `assets/<nombre>/`:**
-- `<nombre>.obj` — mesh Poisson (~57 K caras)
+- `<nombre>.obj` — mesh Poisson (~5–7 K caras con imagen única; ~57 K con RGBD denso)
 - `<nombre>.sdf` — listo para Drake
 - `<nombre>_pointcloud.npy` — nube de puntos completada
 - `<nombre>_parts/` — piezas CoACD
 
-**Tiempo típico (RTX 4000 Ada, 20 GB):** ~23s
+**Tiempo típico (RTX 4000 Ada, 20 GB):** ~20–28s
+
+### Pipeline completo DA3 → SAM2 → numcc → Drake
+
+Script que encadena todos los stages con monitoreo de VRAM:
+
+```bash
+# Pipeline completo (primera vez — corre todo)
+python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto
+
+# Saltar stages ya calculados (reutiliza npz/mask existentes)
+python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+    --skip-da3 --skip-sam2
+
+# Con visualización interactiva en Meshcat (bloquea hasta Ctrl+C)
+python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+    --drake-interactive
+
+# Con UDF threshold relajado (recomendado para objetos pequeños/monoculares)
+python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+    --udf-threshold 0.10
+```
+
+**Outputs en `data/outputs/pipeline/<nombre>/`:**
+- `da3_raw/exports/npz/results.npz` — depth + intrínsecos + extrínsecos de DA3
+- `numcc_input/depth_full.npy` — depth métrico (metros, clip [0.05, 20])
+- `numcc_input/intrinsics.json` — intrínsecos estimados por DA3
+- `numcc_input/mask.npy` — máscara SAM2 redimensionada a resolución del depth
+- `vram_profile.csv` — uso de VRAM por stage
 
 ### dvlt — reconstrucción gaussiana
 ```bash
@@ -230,6 +271,17 @@ da3 image data/images/objeto.jpg \
 - `scene.jpg` — preview side-by-side
 
 **Limitaciones imagen única:** solo reconstruye superficies visibles desde esa cámara. Interiores de objetos (ej. fondo de taza) no se reconstruyen. Para eso usar TripoSR o TRELLIS.
+
+**DA3 entrega depth métrico:** DA3NESTED-GIANT-LARGE produce depth en metros directamente (ej. taza a ~43cm → valores [0.30, 0.85]m). **NO renormalizar** a rangos arbitrarios como [0.1, 1.5]m — destruye la proporción Z/XY y distorsiona la nube de puntos vista desde ángulos laterales. Usar `np.clip(depth, 0.05, 20.0)` como máximo.
+
+**Intrínsecos del NPZ:** corresponden a la resolución procesada por DA3 (ej. 504×378 para una imagen original de 1156×868). DA3 escala los intrínsecos proporcionalmente al redimensionar. El NPZ guarda `image` y `depth` ya en resolución procesada — los intrínsecos son consistentes con esa resolución, no con la imagen original.
+
+**Claves del NPZ de DA3:**
+- `image`: `(N, H, W, 3)` uint8 — imagen procesada (resolución reducida)
+- `depth`: `(N, H, W)` float32 — depth métrico en metros
+- `conf`: `(N, H, W)` float32 — mapa de confianza
+- `intrinsics`: `(N, 3, 3)` float32 — matriz K estimada por el modelo
+- `extrinsics`: `(N, 3, 4)` float32 — pose estimada (identidad para imagen única)
 
 **Bugs corregidos en el CLI de DA3** (`depth-anything-3/src/depth_anything_3/cli.py`):
 - `reference_view_strategy` → `ref_view_strategy` en llamadas a `run_inference()` (4 ocurrencias, líneas ~383, 462, 549, 626)
@@ -289,4 +341,6 @@ Los modelos se guardan en el host y se montan en Docker:
 - SAM2 extensión CUDA (`sam2._C`) no compiló en la imagen x86 actual — funciona igual, solo sin post-procesado de huecos (no afecta resultados en la mayoría de casos)
 - numcc usa `--gpus all` (x86), no `--runtime=nvidia` (Jetson). El `generate_asset.py` ya lo maneja automáticamente según el modelo
 - numcc Dockerfile usa imagen `-devel` (no `-runtime`) para tener nvcc y compilar extensiones CUDA (chamfer_dist, pointops) en build time; requiere `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"` y `numpy<2`
+- numcc `pipeline.py` tiene ENTRYPOINT — al correr Docker los argumentos van directo, sin `python3 /app/pipeline.py` delante
+- `generate_asset.py` no soporta `--mask` para numcc — para pasar máscara SAM2 correr Docker manualmente (ver sección numcc)
 - El gitignore cubre `/assets/` — ningún asset generado se commitea

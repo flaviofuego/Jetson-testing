@@ -190,25 +190,22 @@ def stage_convert(
     header("STAGE 3 — Prepare numcc inputs (full depth + SAM2 mask)")
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── depth: normalize only, DO NOT mask ───────────────────────────────────
+    # ── depth: use DA3 metric output directly, DO NOT renormalize ────────────
+    # DA3NESTED-GIANT-LARGE outputs metric depth in meters.  Re-scaling to an
+    # arbitrary [0.1, 1.5] range destroys the real Z/XY aspect ratio and makes
+    # the point cloud appear stretched along the camera axis when viewed from
+    # the side.  Only clip extreme outliers (sensor noise, sky, etc.).
     data = np.load(str(npz_path), allow_pickle=True)
     print(f"  NPZ keys: {list(data.keys())}")
 
     depth = data["depth"].astype(np.float32)
     if depth.ndim == 3:
         depth = depth[0]
-    print(f"  Raw depth: shape={depth.shape}  range=[{depth.min():.4f}, {depth.max():.4f}]")
+    print(f"  Raw depth (metric): shape={depth.shape}  range=[{depth.min():.4f}, {depth.max():.4f}] m")
 
-    # Normalize to [0.1, 1.5] m without masking.
-    # numcc needs metric-scale XYZ; the mask is applied INSIDE numcc to filter
-    # the point cloud, keeping seen_xyz fully dense (all pixels valid).
-    dmin, dmax = float(depth.min()), float(depth.max())
-    if dmax - dmin > 1e-6:
-        depth_full = 0.1 + (depth - dmin) / (dmax - dmin) * 1.4
-    else:
-        depth_full = np.full_like(depth, 0.5)
+    depth_full = np.clip(depth, 0.05, 20.0)
     valid_px = int((depth_full > 0).sum())
-    print(f"  Scaled:    [{depth_full.min():.2f}, {depth_full.max():.2f}] m  "
+    print(f"  Clipped:   [{depth_full.min():.3f}, {depth_full.max():.3f}] m  "
           f"valid_px={valid_px}/{depth_full.size}")
 
     depth_out = work_dir / "depth_full.npy"
