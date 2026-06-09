@@ -1,0 +1,46 @@
+# x86_64 + NVIDIA GPU (CUDA 12.4, driver >= 525)
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
+
+WORKDIR /app
+
+# Build tools for torchmcubes (C++ + CUDA)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake git g++ ninja-build \
+    libboost-dev libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir --upgrade pip scikit-build-core
+
+# ── 1. TripoSR (use via PYTHONPATH) ──────────────────────────────────────────
+RUN git clone https://github.com/VAST-AI-Research/TripoSR.git /opt/triposr
+
+# ── 2. torchmcubes — CUDA build; TORCH_CUDA_ARCH_LIST needed at build time ───
+RUN TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" \
+    TORCH_DIR=$(python3 -c \
+      "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'share/cmake/Torch'))") \
+    && CMAKE_ARGS="-DTorch_DIR=${TORCH_DIR}" \
+       pip install --no-cache-dir \
+       'torchmcubes @ git+https://github.com/tatsy/torchmcubes.git@3381600ddc3d2e4d74222f8495866be5fafbace4'
+
+# ── 3. Runtime deps ───────────────────────────────────────────────────────────
+COPY requirements.txt /app/requirements.txt
+# Use onnxruntime-gpu (rembg background removal on CUDA) and unpin old versions
+RUN sed 's/onnxruntime$/onnxruntime-gpu/' /app/requirements.txt \
+    | sed 's/transformers==.*/transformers>=4.35.0,<5.0.0/' \
+    | sed 's/huggingface-hub==.*/huggingface-hub>=0.17.3/' \
+    | sed 's/tokenizers==.*/tokenizers/' \
+    | sed 's/rembg==.*/rembg[gpu]/' \
+    | pip install --no-cache-dir -r /dev/stdin
+
+# ── 4. Pipeline modules ───────────────────────────────────────────────────────
+COPY image_utils.py mesh_utils.py sdf_generator.py pipeline.py /app/
+
+# ── 5. Runtime environment ────────────────────────────────────────────────────
+# Models mounted at runtime: -v ~/models/huggingface:/root/.cache/huggingface
+# Pre-download with: python3 tools/download_models.py
+ENV HF_HOME=/root/.cache/huggingface
+ENV PYTHONPATH=/opt/triposr:/app
+ENV PYTHONWARNINGS=ignore::FutureWarning,ignore::UserWarning
+ENV TRANSFORMERS_VERBOSITY=error
+
+ENTRYPOINT ["python3", "/app/pipeline.py"]
