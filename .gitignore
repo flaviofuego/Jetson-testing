@@ -18,6 +18,13 @@ Thumbs.db
 
 # Superpowers internal docs (not part of project)
 docs/superpowers/
-/assets
+
+# Generated assets (all pipelines: TripoSR, TRELLIS, NU-MCC)
+/assets/
+
+# Submodule content tracked separately
 /dvlt.cu
+
 tools/download_models_trellis_windows.py
+data/outputs/**
+.claude/**

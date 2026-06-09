@@ -2,17 +2,20 @@
 
 ## Proyecto
 
-Cinco pipelines para generar assets 3D desde imágenes, listos para simulación robótica con Drake. Más un pipeline de estimación de profundidad monocular.
+Seis pipelines para generar assets 3D desde imágenes o datos RGBD, listos para simulación robótica con Drake. Más un pipeline de estimación de profundidad monocular.
 
 | Pipeline | Modelo | Entrada | Salida |
 |----------|--------|---------|--------|
 | SAM2 | SAM2.1 small (Meta) | 1 imagen | objeto recortado PNG (fondo blanco) |
 | TripoSR | TripoSR (Stability AI) | 1 imagen | OBJ + SDF |
 | TRELLIS | TRELLIS-image-large (Microsoft) | 1 imagen | GLB + OBJ + SDF |
+| **numcc** | **P2C + NU-MCC (CO3D-V2)** | **depth map + color (RGBD)** | **OBJ + SDF** |
 | dvlt.cu | DVLT (NVIDIA) | 1+ imágenes | PLY gaussiano → OBJ |
 | depth-anything-3 | DA3NESTED-GIANT-LARGE (ByteDance) | 1+ imágenes | depth map + GLB point cloud |
 
-**Flujo típico:** SAM2 → TripoSR o TRELLIS (SAM2 reemplaza a rembg para segmentar el objeto antes de la reconstrucción 3D)
+**Flujo típico imagen:** SAM2 → TripoSR o TRELLIS (SAM2 reemplaza a rembg para segmentar el objeto antes de la reconstrucción 3D)
+
+**Flujo RGBD (cámara de profundidad / simulación Drake):** depth + color → numcc (P2C + NU-MCC) → OBJ + SDF
 
 ## Hardware / Conexión
 
@@ -46,12 +49,20 @@ trellis/
   mesh_utils.py
   sdf_generator.py
   requirements.txt
+numcc/
+  Dockerfile.x86        # GPU x86 — base pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
+  pipeline.py           # depth → P2C → NU-MCC → surface pts → Poisson → coacd → SDF
+  pointcloud_utils.py   # back-projection depth → nube de puntos
+  mesh_utils.py
+  sdf_generator.py
+  requirements.txt
 dvlt.cu/                # submodulo — reconstrucción 3D gaussiana
   run_dvlt.sh           # wrapper para correr dvlt con una carpeta de imágenes
 tools/
   generate_asset.py         # wrapper principal (soporta sam2, triposr, trellis, numcc)
   download_models.py        # descarga modelos TripoSR en la Jetson
   download_models_trellis.py        # descarga modelos TRELLIS en la Jetson
+  download_models_numcc.py          # descarga pesos P2C (Google Drive) y NU-MCC (S3)
   download_models_trellis_windows.py # descarga modelos TRELLIS en Windows + scp a Jetson
   ply_to_obj.py             # convierte PLY gaussiano (dvlt) a OBJ mesh
 data/
@@ -70,6 +81,7 @@ data/
 | `triposr:x86` | `triposr/Dockerfile.x86` | `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel` | x86 GPU |
 | `trellis` | `trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU |
 | `trellis:x86` | `trellis/Dockerfile.x86` | - | x86 GPU |
+| `numcc:x86` | `numcc/Dockerfile.x86` | `pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel` | x86 GPU |
 | `dvlt:jetson` | `dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU |
 
 ## Comandos principales
@@ -123,6 +135,56 @@ python3 tools/download_models_trellis.py
 # Generar (desde Jetson-testing/)
 python3 tools/generate_asset.py data/images/imagen.png --name objeto --model trellis
 ```
+
+### numcc — reconstrucción RGBD (P2C + NU-MCC)
+
+Pipeline para reconstruir objetos desde depth map + imagen de color (RGBD). Especialmente útil con simulaciones Drake (AIRA) o cámaras de profundidad reales.
+
+```bash
+# Descargar pesos (una sola vez)
+python3 tools/download_models_numcc.py
+# → ~/models/numcc/p2c/p2c_checkpoint.pth  (1.9 GB, Google Drive)
+# → ~/models/numcc/numcc/numcc_checkpoint.pth  (2.4 GB, S3)
+
+# Construir imagen Docker (una sola vez, ~10 min)
+docker build -t numcc:x86 -f numcc/Dockerfile.x86 numcc/
+
+# Generar asset desde depth map
+python3 tools/generate_asset.py --model numcc \
+    --depth data/depth.npy \
+    --color data/color.npy \
+    --intrinsics data/intrinsics.json \
+    --name nombre_objeto
+
+# Con intrínsecas directas (sin archivo JSON)
+python3 tools/generate_asset.py --model numcc \
+    --depth data/depth.npy \
+    --name objeto \
+    --fx 579.4 --fy 579.4 --cx 319.5 --cy 239.5
+```
+
+**Formatos aceptados:**
+- `--depth`: `.npy` (float32, metros) o `.png` (uint16, milímetros)
+- `--color`: `.npy` (uint8 HxWx3 o HxWx4 RGBA) o `.png`
+- `--intrinsics`: JSON con claves `fx`, `fy`, `cx`, `cy`
+
+**Intrínsecas de la cámara Drake (AIRA):** fx=fy=579.41, cx=319.5, cy=239.5 (imagen 640×480, FOV 45°)
+
+**Nota sobre el checkpoint P2C:** el archivo descargado (`p2c_checkpoint.pth`) es un ZIP con checkpoints por categoría ShapeNet (plane/car/chair/lamp/sofa/table/watercraft/cabinet). No corresponde a la arquitectura P2C de CuiRuikai. El pipeline tiene fallback gracioso — si `load_state_dict` falla, pasa la nube de depth directamente a NU-MCC sin completar.
+
+**Parámetros reales del checkpoint NU-MCC (udf-ep99.pth, CO3D-V2):**
+- `n_groups=200` (shape de init_embedding en el checkpoint)
+- `nn_seen=3` (con -1 → OOM de 95 GiB)
+- `seen_xyz`: mapa XYZ 2D `(B, 112, 112, 3)` del depth back-proyectado, NO nube plana
+- `seen_images`: 800×800 obligatorio (assert en preprocess_img)
+
+**Outputs en `assets/<nombre>/`:**
+- `<nombre>.obj` — mesh Poisson (~57 K caras)
+- `<nombre>.sdf` — listo para Drake
+- `<nombre>_pointcloud.npy` — nube de puntos completada
+- `<nombre>_parts/` — piezas CoACD
+
+**Tiempo típico (RTX 4000 Ada, 20 GB):** ~23s
 
 ### dvlt — reconstrucción gaussiana
 ```bash
@@ -204,6 +266,8 @@ Los modelos se guardan en el host y se montan en Docker:
 | rembg U2-Net | `~/.u2net/` | ~176 MB |
 | TRELLIS-image-large | `~/models/huggingface/` | ~3 GB |
 | dvlt weights | `~/dvlt.cu/model/` | ~468 MB |
+| P2C checkpoint (zip categorías) | `~/models/numcc/p2c/` | 1.9 GB |
+| NU-MCC CO3D-V2 (udf-ep99.pth) | `~/models/numcc/numcc/` | 2.4 GB |
 
 ## Optimizaciones activas (TripoSR)
 
@@ -223,3 +287,6 @@ Los modelos se guardan en el host y se montan en Docker:
 - xformers instalado pero sin extensiones CUDA (torch 2.12 vs xformers compilado para 2.10) — funciona igual, solo sin memory-efficient attention
 - La IP de la Jetson cambia por DHCP — pendiente configurar IP estática en el router
 - SAM2 extensión CUDA (`sam2._C`) no compiló en la imagen x86 actual — funciona igual, solo sin post-procesado de huecos (no afecta resultados en la mayoría de casos)
+- numcc usa `--gpus all` (x86), no `--runtime=nvidia` (Jetson). El `generate_asset.py` ya lo maneja automáticamente según el modelo
+- numcc Dockerfile usa imagen `-devel` (no `-runtime`) para tener nvcc y compilar extensiones CUDA (chamfer_dist, pointops) en build time; requiere `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"` y `numpy<2`
+- El gitignore cubre `/assets/` — ningún asset generado se commitea
