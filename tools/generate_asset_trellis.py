@@ -12,7 +12,11 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
-IMAGE_NAME = "trellis"
+# Default image name; use trellis:x86 for local x86+GPU builds
+IMAGE_NAME = "trellis:x86"
+# Models are cached here on the host and mounted read-only into the container.
+# Pre-download once with: python3 tools/download_models_trellis.py
+MODELS_DIR = Path.home() / "models" / "huggingface"
 
 
 def resolve_asset_name(image_path: Path, name: str | None) -> str:
@@ -29,12 +33,14 @@ def build_docker_command(
     image_path = image_path.resolve()
     assets_dir = (project_root / "assets").resolve()
     assets_dir.mkdir(parents=True, exist_ok=True)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
     return [
         "docker", "run", "--rm",
         "--gpus", "all",
         "-v", f"{image_path.parent}:/input:ro",
         "-v", f"{assets_dir}:/output",
+        "-v", f"{MODELS_DIR}:/root/.cache/huggingface",
         IMAGE_NAME,
         "--input", f"/input/{image_path.name}",
         "--output", "/output",

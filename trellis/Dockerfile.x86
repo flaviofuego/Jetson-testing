@@ -1,0 +1,66 @@
+# x86_64 + NVIDIA GPU (CUDA 12.4, driver >= 525)
+FROM pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel
+
+WORKDIR /app
+
+# Build tools + OpenGL headless (required by trimesh, nvdiffrast)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    cmake git g++ ninja-build \
+    libboost-dev libgl1 libglib2.0-0 libgomp1 \
+    libglfw3-dev libglew-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Upgrade pip
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ── 1. spconv — pre-built wheel for x86 + CUDA 12.4 ──────────────────────────
+RUN pip install --no-cache-dir spconv-cu124
+
+# ── 2. nvdiffrast — CUDA rasterizer for GLB texture baking ───────────────────
+# TORCH_CUDA_ARCH_LIST must be set at build time (no GPU in build context).
+# Covers Turing(7.5) Ampere(8.0,8.6) Ada(8.9) Hopper(9.0).
+RUN TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" \
+    pip install --no-cache-dir --no-build-isolation \
+    'nvdiffrast @ git+https://github.com/NVlabs/nvdiffrast.git'
+
+# ── 3. Clone TRELLIS with submodules (flexicubes lives in a submodule) ────────
+RUN git clone --recursive https://github.com/microsoft/TRELLIS.git /opt/trellis
+
+# ── 4. Runtime Python deps ────────────────────────────────────────────────────
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# utils3d — required by TRELLIS, not on PyPI
+RUN pip install --no-cache-dir \
+    'git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8'
+
+# kaolin — required by flexicubes (TRELLIS submodule); use torch-2.4.0_cu121 wheel (binary-compatible with 2.4.1+cu124)
+RUN pip install --no-cache-dir kaolin \
+    -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.4.0_cu121.html
+
+# flash_attn — pre-built wheel for Python 3.11 + CUDA 12.x + torch 2.4 (cxx11abiFALSE matches pytorch/pytorch base image)
+RUN pip install --no-cache-dir \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3/flash_attn-2.8.3%2Bcu12torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl"
+
+# diff-gaussian-rasterization — required for Gaussian splatting postprocessing (GLB texture baking)
+RUN git clone --recursive https://github.com/autonomousvision/mip-splatting.git /tmp/mip-splatting \
+    && TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9;9.0" \
+       pip install --no-cache-dir --no-build-isolation \
+       /tmp/mip-splatting/submodules/diff-gaussian-rasterization/ \
+    && rm -rf /tmp/mip-splatting
+
+# ── 5. Pipeline modules ───────────────────────────────────────────────────────
+COPY image_utils.py mesh_utils.py sdf_generator.py pipeline.py /app/
+
+# ── 6. Runtime environment ────────────────────────────────────────────────────
+# Models are downloaded once on the host and mounted at runtime via:
+#   -v ~/models/huggingface:/root/.cache/huggingface
+# Run `python3 tools/download_models_trellis.py` on the host first.
+ENV HF_HOME=/root/.cache/huggingface
+ENV PYTHONPATH=/opt/trellis:/app
+ENV PYTHONWARNINGS=ignore::FutureWarning,ignore::UserWarning
+ENV TRANSFORMERS_VERBOSITY=error
+# Use flash_attn for both dense and sparse attention
+ENV ATTN_BACKEND=flash_attn
+
+ENTRYPOINT ["python3", "/app/pipeline.py"]
