@@ -154,24 +154,26 @@ def run_numcc(
     model.load_state_dict(state)
     model.eval().cuda()
 
-    # ── seen_images: resize to 800×800 (preprocess_img assertion) ────────────
-    if color.dtype == np.uint8:
-        color_f = color.astype(np.float32) / 255.0
+    # ── seen_images: (1, 3, 800, 800) ────────────────────────────────────────
+    # Drop alpha channel if RGBA — model expects exactly 3 channels.
+    color_rgb = color[:, :, :3]
+    if color_rgb.dtype == np.uint8:
+        color_f = color_rgb.astype(np.float32) / 255.0
     else:
-        color_f = color.astype(np.float32)
+        color_f = color_rgb.astype(np.float32).clip(0.0, 1.0)
     seen_images = torch.from_numpy(color_f.transpose(2, 0, 1)).float().unsqueeze(0).cuda()
+    # preprocess_img (called later) asserts input is 800×800 before downscaling to 224.
     if seen_images.shape[2] != 800 or seen_images.shape[3] != 800:
         seen_images = F.interpolate(seen_images, size=(800, 800), mode="bilinear", align_corners=False)
 
-    # ── seen_xyz: (1, 112, 112, 3) — per-pixel XYZ map from depth ────────────
+    # ── xyz_map at 112×112: back-project downsampled depth ───────────────────
     H_orig, W_orig = depth.shape
-    # Nearest-neighbour preserves valid/invalid boundaries without introducing
-    # spurious near-zero values at the edge between object and background.
     depth_t = torch.from_numpy(depth).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+    # Nearest-neighbour preserves valid/invalid pixel boundaries exactly.
     depth_small = F.interpolate(depth_t, size=(XYZ_SIZE, XYZ_SIZE), mode="nearest")
     depth_small = depth_small.squeeze().numpy()  # (112, 112)
 
-    # Scale intrinsics to the downsampled resolution
+    # Scale intrinsics proportionally to the new resolution.
     scale_x = XYZ_SIZE / W_orig
     scale_y = XYZ_SIZE / H_orig
     fx_s, fy_s = fx * scale_x, fy * scale_y
@@ -182,31 +184,59 @@ def run_numcc(
     X = (u_idx - cx_s) * Z / fx_s
     Y = (v_idx - cy_s) * Z / fy_s
     xyz_map = np.stack([X, Y, Z], axis=-1).astype(np.float32)  # (112, 112, 3)
-    xyz_map[Z == 0] = np.nan  # mark invalid (no depth)
+    xyz_map[Z == 0] = np.nan  # no depth → invalid
 
-    seen_xyz_t = torch.from_numpy(xyz_map).unsqueeze(0).cuda()  # (1, 112, 112, 3)
-    valid_seen = torch.isfinite(seen_xyz_t.sum(-1))             # (1, 112, 112) — depth > 0
-
-    # Restrict valid observations to object pixels via SAM2 mask.
-    # This prevents the background scene from interfering with the encoder
-    # and matches the single-object training distribution of CO3D-V2.
+    # ── apply SAM2 mask at numpy level (before normalization) ────────────────
+    # The demo (demo_iphone.py) masks *before* normalize(), so stats are computed
+    # from object pixels only — not the background scene.
     if seen_mask is not None:
         from PIL import Image as PILImage
         m_img = PILImage.fromarray(seen_mask.astype(np.uint8) * 255).resize(
             (XYZ_SIZE, XYZ_SIZE), PILImage.NEAREST
         )
-        mask_small = torch.from_numpy(np.asarray(m_img) > 0).unsqueeze(0).cuda()
-        valid_seen = valid_seen & mask_small
-        print(f"      seen_xyz valid: {valid_seen.sum().item()} / {XYZ_SIZE**2} px (mask-filtered)")
+        mask_small_np = np.asarray(m_img) > 0  # (112, 112) bool
+        xyz_map[~mask_small_np] = np.nan  # background pixels → invalid
+
+    # ── normalize seen_xyz — matches demo_iphone.py normalize() ─────────────
+    # CO3D-V2 training uses point clouds normalized to zero-mean, unit std.
+    # Without this the XYZPosEmbed linear layer receives out-of-distribution
+    # metric-scale coords (e.g. Z≈0.5 m) and produces garbage UDF predictions.
+    valid_mask = np.isfinite(xyz_map).all(-1)   # (112, 112)
+    valid_pts  = xyz_map[valid_mask]             # (K, 3)
+    norm_center = np.zeros(3, dtype=np.float32)
+    norm_scale  = 1.0
+    if len(valid_pts) >= 3:
+        per_axis_std = (valid_pts.var(axis=0) ** 0.5)   # (3,) — std per axis
+        _scale = float(per_axis_std.mean())
+        if _scale > 1e-6:
+            norm_center = valid_pts.mean(axis=0)         # (3,)
+            norm_scale  = _scale
+            xyz_map[valid_mask] = (xyz_map[valid_mask] - norm_center) / norm_scale
+            print(f"      normalize: center={norm_center.round(3)}  scale={norm_scale:.4f}")
+        else:
+            print("      WARNING: near-zero variance in seen_xyz — normalization skipped")
     else:
-        print(f"      seen_xyz valid: {valid_seen.sum().item()} / {XYZ_SIZE**2} px")
+        print(f"      WARNING: only {len(valid_pts)} valid xyz pixels — normalization skipped")
 
-    seen_xyz_t[~valid_seen] = -100.0
-
-    # ── query grid: build around point cloud bounding box ────────────────────
+    # Apply the same linear transform to query_pts so both are in the same space.
     if query_pts is None:
-        query_pts = xyz_map[np.isfinite(xyz_map).all(-1)]
-    padding = 0.05
+        query_pts = xyz_map[valid_mask]  # already normalized
+    else:
+        query_pts = (query_pts - norm_center) / norm_scale
+
+    # ── convert to tensor ─────────────────────────────────────────────────────
+    seen_xyz_t = torch.from_numpy(xyz_map).unsqueeze(0).cuda()  # (1, 112, 112, 3)
+    valid_seen = torch.isfinite(seen_xyz_t.sum(-1))              # (1, 112, 112)
+    # float('inf') as sentinel for invalid: shrink_points_beyond_threshold skips
+    # non-finite values, and XYZPosEmbed overwrites them with invalid_xyz_token.
+    seen_xyz_t[~valid_seen] = float('inf')
+    print(f"      seen_xyz valid: {valid_seen.sum().item()} / {XYZ_SIZE**2} px"
+          + (" (depth+mask)" if seen_mask is not None else " (depth only)"))
+
+    # ── query grid in normalized coordinate space ─────────────────────────────
+    # Use 0.3 padding in normalized units (matches the ±0.3 offset the demo uses
+    # around anchor-predicted centers). Camera-frame query_pts were normalized above.
+    padding = 0.3
     mins = query_pts.min(axis=0) - padding
     maxs = query_pts.max(axis=0) + padding
     n_side = int(np.cbrt(n_query))
@@ -249,8 +279,11 @@ def run_numcc(
         print(f"      UDF < {t:.2f}: {(all_udf < t).sum()} pts")
 
     if not surface_pts:
+        # Fallback: return normalized seen_xyz points — mesh_utils.normalize_mesh
+        # rescales by longest axis anyway, so normalized coords are acceptable.
         valid = np.isfinite(xyz_map).all(-1)
         return xyz_map[valid]
+    # Surface points are in normalized space; normalize_mesh handles rescaling.
     return np.concatenate(surface_pts, axis=0)
 
 
@@ -334,8 +367,9 @@ def main():
                         help="Color file (.npy uint8 or .png). Required for best NU-MCC quality.")
     parser.add_argument("--mask",       default=None,  type=Path,
                         help="SAM2 binary mask .npy (H×W uint8, 1=object). "
-                             "Filters the back-projected point cloud to object pixels only. "
-                             "Does NOT alter seen_xyz — full depth is always passed to NU-MCC.")
+                             "Filters the back-projected point cloud AND restricts seen_xyz "
+                             "to object pixels only (background set to invalid). "
+                             "Normalization stats computed from object pixels only.")
     parser.add_argument("--intrinsics", default=None,  type=Path,
                         help="intrinsics.json with fx/fy/cx/cy")
     parser.add_argument("--fx",         default=None,  type=float)
