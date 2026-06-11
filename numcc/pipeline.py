@@ -889,17 +889,11 @@ def main():
         raw_mesh_noksr = _points_to_mesh_noksr(surface_pts)
         print(f"       nksr raw mesh: {len(raw_mesh_noksr.faces)} faces")
 
-    # ── floor cap: cut at support plane + add contour-following cap ──────────
-    if z_floor_norm is not None:
-        print("[4c/6] Applying floor cap (slice at support plane + contour cap)...")
-        if raw_mesh_poisson is not None:
-            raw_mesh_poisson = _slice_and_cap_at_floor(raw_mesh_poisson, z_floor_norm)
-        if raw_mesh_noksr is not None:
-            raw_mesh_noksr = _slice_and_cap_at_floor(raw_mesh_noksr, z_floor_norm)
-
-    # ── silhouette clip: remove lateral excess using SAM2 mask projection ─────
+    # ── silhouette clip first: remove lateral excess before adding floor cap ───
+    # Must run BEFORE floor cap so the cap vertices (which project below the mask
+    # footprint) are not clipped away.
     if seen_mask is not None:
-        print("[4d/6] Clipping lateral excess via SAM2 mask silhouette...")
+        print("[4c/6] Clipping lateral excess via SAM2 mask silhouette...")
         if raw_mesh_poisson is not None:
             raw_mesh_poisson = _clip_by_mask_silhouette(
                 raw_mesh_poisson, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
@@ -908,6 +902,14 @@ def main():
             raw_mesh_noksr = _clip_by_mask_silhouette(
                 raw_mesh_noksr, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
                 dilation_px=5)
+
+    # ── floor cap: cut at support plane + add contour-following cap ──────────
+    if z_floor_norm is not None:
+        print("[4d/6] Applying floor cap (slice at support plane + contour cap)...")
+        if raw_mesh_poisson is not None:
+            raw_mesh_poisson = _slice_and_cap_at_floor(raw_mesh_poisson, z_floor_norm)
+        if raw_mesh_noksr is not None:
+            raw_mesh_noksr = _slice_and_cap_at_floor(raw_mesh_noksr, z_floor_norm)
 
     # Primary mesh: noksr when available, else poisson
     raw_mesh = raw_mesh_noksr if raw_mesh_noksr is not None else raw_mesh_poisson
