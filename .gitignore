@@ -25,6 +25,9 @@ docs/superpowers/
 # Submodule content tracked separately
 /dvlt.cu
 
+# External repos (not submodules)
+/aira/
+
 tools/download_models_trellis_windows.py
 data/outputs/**
 .claude/**

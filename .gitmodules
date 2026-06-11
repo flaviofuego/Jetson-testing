@@ -10,6 +10,3 @@
 [submodule "numcc/nksr"]
 	path = numcc/nksr
 	url = https://github.com/nv-tlabs/nksr.git
-[submodule "aira"]
-	path = aira
-	url = https://github.com/UnderJollyRogers/AIRA
