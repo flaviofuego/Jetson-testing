@@ -383,35 +383,48 @@ def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "tr
                   f"removed {n_removed} faces  no valid loops found")
             return mesh_cut
 
-        # Step 4: triangulate loops using shapely — filter noise, merge significant loops
+        # Step 4: triangulate loops using shapely + interpolate Z from actual boundary.
+        #
+        # The boundary has varying Z (the object is sloped). Instead of a flat cap at
+        # z_floor_norm, we:
+        #   1. Triangulate the XY footprint with shapely (handles noise, multiple loops)
+        #   2. For every triangulated vertex, interpolate its Z from the actual boundary
+        #      vertices using scipy linear interpolation — so the cap follows the real
+        #      3D terrain of the boundary instead of a flat plane.
         from shapely.geometry import Polygon as ShapelyPolygon
         from shapely.ops import unary_union
+        from scipy.interpolate import griddata
 
-        # Build shapely polygons from each loop and filter by minimum area.
-        # The boundary at the cut level has many tiny fragments (Poisson noise);
-        # only keep loops whose area > 1% of the largest loop's area.
-        raw_polys = []
+        # Collect boundary control points (XY → Z) from all significant loops.
+        # Used for Z interpolation of interior cap vertices.
+        raw_polys  = []
+        ctrl_xy_list: list = []
+        ctrl_z_list:  list = []
+
         for loop in loops:
-            xy = mesh_cut.vertices[loop, :2]
-            poly = ShapelyPolygon(xy)
+            pts = mesh_cut.vertices[loop]           # (N, 3) real 3D positions
+            poly = ShapelyPolygon(pts[:, :2])
             if not poly.is_valid:
                 poly = poly.buffer(0)
             if poly.area > 1e-8:
                 raw_polys.append(poly)
+                ctrl_xy_list.append(pts[:, :2])
+                ctrl_z_list.append(pts[:, 2])
 
         if not raw_polys:
             print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
                   f"removed {n_removed} faces  no valid polygons")
             return mesh_cut
 
+        # Z interpolation grid from all boundary vertices
+        ctrl_xy = np.vstack(ctrl_xy_list)
+        ctrl_z  = np.concatenate(ctrl_z_list)
+
         max_area = max(p.area for p in raw_polys)
         significant = [p for p in raw_polys if p.area >= 0.01 * max_area]
-        # Expand each polygon slightly to bridge boundary gaps left by Poisson slicing,
-        # merge into one shape, then shrink back to original size.
-        buf = max_area ** 0.5 * 0.05   # 5% of the characteristic length
+        buf = max_area ** 0.5 * 0.05
         merged = unary_union([p.buffer(buf) for p in significant]).buffer(-buf * 0.5).buffer(0)
 
-        # Triangulate merged polygon (may be MultiPolygon)
         geoms = list(getattr(merged, "geoms", [merged]))
         cap_verts_list: list = []
         cap_faces_list: list = []
@@ -427,7 +440,12 @@ def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "tr
                 continue
             if v2d is None or len(f2d) == 0:
                 continue
-            v3d = np.column_stack([v2d, np.full(len(v2d), z_floor_norm)])
+            # Interpolate Z for each cap vertex from the real boundary Z values.
+            # 'linear' = smooth surface; fall back to 'nearest' for points outside hull.
+            z_lin = griddata(ctrl_xy, ctrl_z, v2d, method="linear")
+            z_nn  = griddata(ctrl_xy, ctrl_z, v2d, method="nearest")
+            z_interp = np.where(np.isnan(z_lin), z_nn, z_lin)
+            v3d = np.column_stack([v2d, z_interp])
             cap_verts_list.append(v3d)
             cap_faces_list.append(f2d + n_base + offset)
             offset += len(v3d)
