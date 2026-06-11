@@ -598,6 +598,58 @@ def _points_to_mesh(surface_pts: np.ndarray, poisson_depth: int = 10) -> "trimes
         return trimesh.PointCloud(surface_pts).convex_hull
 
 
+def _clip_by_mask_silhouette(
+    mesh: "trimesh.Trimesh",
+    norm_center: np.ndarray,
+    norm_scale: float,
+    fx: float, fy: float, cx: float, cy: float,
+    mask: np.ndarray,
+    dilation_px: int = 15,
+) -> "trimesh.Trimesh":
+    """Remove faces that project outside the SAM2 mask when viewed from the camera.
+
+    Projects each vertex from NU-MCC normalized space → metric camera space → pixel.
+    Keeps a face if AT LEAST ONE of its vertices projects inside the dilated mask.
+    Dilation avoids over-clipping at the object silhouette boundary.
+    """
+    import trimesh
+    from scipy.ndimage import binary_dilation
+
+    mask_bin = mask.astype(bool)
+    if dilation_px > 0:
+        struct = np.ones((dilation_px * 2 + 1, dilation_px * 2 + 1), dtype=bool)
+        mask_bin = binary_dilation(mask_bin, structure=struct)
+    H, W = mask_bin.shape
+
+    # Normalized → metric camera space
+    verts_m = mesh.vertices * norm_scale + norm_center  # (N, 3)
+    X, Y, Z = verts_m[:, 0], verts_m[:, 1], verts_m[:, 2]
+
+    valid = Z > 0
+    u = np.where(valid, (fx * X / np.where(valid, Z, 1)) + cx, -1.0)
+    v = np.where(valid, (fy * Y / np.where(valid, Z, 1)) + cy, -1.0)
+
+    ui = np.round(u).astype(int)
+    vi = np.round(v).astype(int)
+
+    in_bounds = valid & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+    in_mask = np.zeros(len(verts_m), dtype=bool)
+    in_mask[in_bounds] = mask_bin[vi[in_bounds], ui[in_bounds]]
+
+    # Keep face if any vertex is inside mask
+    keep = in_mask[mesh.faces].any(axis=1)
+    n_removed = int((~keep).sum())
+    if n_removed == 0:
+        return mesh
+
+    mesh_clipped = trimesh.Trimesh(
+        vertices=mesh.vertices, faces=mesh.faces[keep], process=True
+    )
+    print(f"      silhouette clip: removed {n_removed} faces  "
+          f"kept {len(mesh_clipped.faces)}  (dilation={dilation_px}px)")
+    return mesh_clipped
+
+
 def _save_ply(path: Path, pts: np.ndarray, colors: np.ndarray | None = None):
     """Write binary little-endian PLY. pts: (N,3) float32, colors: (N,3) uint8."""
     N = len(pts)
@@ -844,6 +896,16 @@ def main():
             raw_mesh_poisson = _slice_and_cap_at_floor(raw_mesh_poisson, z_floor_norm)
         if raw_mesh_noksr is not None:
             raw_mesh_noksr = _slice_and_cap_at_floor(raw_mesh_noksr, z_floor_norm)
+
+    # ── silhouette clip: remove lateral excess using SAM2 mask projection ─────
+    if seen_mask is not None:
+        print("[4d/6] Clipping lateral excess via SAM2 mask silhouette...")
+        if raw_mesh_poisson is not None:
+            raw_mesh_poisson = _clip_by_mask_silhouette(
+                raw_mesh_poisson, norm_center, norm_scale, fx, fy, cx, cy, seen_mask)
+        if raw_mesh_noksr is not None:
+            raw_mesh_noksr = _clip_by_mask_silhouette(
+                raw_mesh_noksr, norm_center, norm_scale, fx, fy, cx, cy, seen_mask)
 
     # Primary mesh: noksr when available, else poisson
     raw_mesh = raw_mesh_noksr if raw_mesh_noksr is not None else raw_mesh_poisson
