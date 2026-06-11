@@ -383,70 +383,59 @@ def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "tr
                   f"removed {n_removed} faces  no valid loops found")
             return mesh_cut
 
-        # Step 4: triangulate loops using shapely — filter noise, merge significant loops
-        from shapely.geometry import Polygon as ShapelyPolygon
-        from shapely.ops import unary_union
-
-        # Build shapely polygons from each loop and filter by minimum area.
-        # The boundary at the cut level has many tiny fragments (Poisson noise);
-        # only keep loops whose area > 1% of the largest loop's area.
-        raw_polys = []
+        # Step 4: 3D fan triangulation — each loop is closed using its own 3D centroid.
+        #
+        # Why NOT a flat Z cap: the boundary after slicing has varying Z values
+        # (the screwdriver has a slope). Projecting all boundary vertices to a single
+        # Z leaves gaps where the boundary is higher. Using the actual 3D positions
+        # guarantees that every boundary edge is touched exactly.
+        #
+        # Filter: keep only loops with XY area >= 1% of the largest loop's XY area.
+        loop_areas = []
         for loop in loops:
             xy = mesh_cut.vertices[loop, :2]
-            poly = ShapelyPolygon(xy)
-            if not poly.is_valid:
-                poly = poly.buffer(0)
-            if poly.area > 1e-8:
-                raw_polys.append(poly)
+            from shapely.geometry import Polygon as _Poly
+            p = _Poly(xy)
+            loop_areas.append(abs(p.area) if p.is_valid else 0.0)
 
-        if not raw_polys:
+        if not any(a > 0 for a in loop_areas):
             print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
-                  f"removed {n_removed} faces  no valid polygons")
+                  f"removed {n_removed} faces  no valid loops")
             return mesh_cut
 
-        max_area = max(p.area for p in raw_polys)
-        significant = [p for p in raw_polys if p.area >= 0.01 * max_area]
-        # Expand each polygon slightly to bridge boundary gaps left by Poisson slicing,
-        # merge into one shape, then shrink back to original size.
-        buf = max_area ** 0.5 * 0.05   # 5% of the characteristic length
-        merged = unary_union([p.buffer(buf) for p in significant]).buffer(-buf * 0.5).buffer(0)
+        max_area = max(loop_areas)
+        significant_loops = [loop for loop, area in zip(loops, loop_areas)
+                              if area >= 0.01 * max_area]
 
-        # Triangulate merged polygon (may be MultiPolygon)
-        geoms = list(getattr(merged, "geoms", [merged]))
-        cap_verts_list: list = []
+        # Fan-triangulate each significant loop in 3D
+        new_verts = list(mesh_cut.vertices)   # extend with centroid(s)
         cap_faces_list: list = []
-        n_base = len(mesh_cut.vertices)
-        offset = 0
 
-        for poly in geoms:
-            if poly.is_empty or poly.area < 1e-8:
-                continue
-            try:
-                v2d, f2d = trimesh.creation.triangulate_polygon(poly, engine="earcut")
-            except Exception:
-                continue
-            if v2d is None or len(f2d) == 0:
-                continue
-            v3d = np.column_stack([v2d, np.full(len(v2d), z_floor_norm)])
-            cap_verts_list.append(v3d)
-            cap_faces_list.append(f2d + n_base + offset)
-            offset += len(v3d)
+        for loop in significant_loops:
+            verts_3d = mesh_cut.vertices[loop]          # actual 3D positions
+            centroid_3d = verts_3d.mean(axis=0)          # 3D centroid of this loop
+            centroid_idx = len(new_verts)
+            new_verts.append(centroid_3d)
+
+            n = len(loop)
+            for i in range(n):
+                a = loop[i]
+                b = loop[(i + 1) % n]
+                c = centroid_idx
+                # Ensure outward normal (+Z toward bin).
+                va, vb, vc = new_verts[a], new_verts[b], centroid_3d
+                nz = (vb[0]-va[0])*(vc[1]-va[1]) - (vb[1]-va[1])*(vc[0]-va[0])
+                cap_faces_list.append([a, b, c] if nz > 0 else [a, c, b])
+
+        cap_verts_list = [np.array(new_verts)]
 
         if not cap_faces_list:
             print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
                   f"removed {n_removed} faces  triangulation produced no faces")
             return mesh_cut
 
-        all_verts = np.vstack([mesh_cut.vertices] + cap_verts_list)
-        all_cap_faces = np.vstack(cap_faces_list)
-
-        # Ensure cap normals point outward (+Z toward bin)
-        for i, f in enumerate(all_cap_faces):
-            v = all_verts[f]
-            nz = (v[1,0]-v[0,0])*(v[2,1]-v[0,1]) - (v[1,1]-v[0,1])*(v[2,0]-v[0,0])
-            if nz < 0:
-                all_cap_faces[i] = f[::-1]
-
+        all_verts = np.array(new_verts)
+        all_cap_faces = np.array(cap_faces_list, dtype=np.int64)
         all_faces = np.vstack([mesh_cut.faces, all_cap_faces])
         mesh_final = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
 
