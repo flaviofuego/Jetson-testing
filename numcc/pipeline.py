@@ -339,88 +339,121 @@ def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "tr
         )
         n_removed = len(mesh.faces) - len(mesh_cut.faces)
 
-        # Step 2: find boundary edges (edges that appear only once = open boundary)
+        # Step 2: find boundary edges (appear only once = open boundary at cut)
         edges_sorted = np.sort(mesh_cut.edges, axis=1)
         unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
-        boundary = unique_edges[counts == 1]        # (N, 2) vertex index pairs
+        boundary = unique_edges[counts == 1]
         if len(boundary) == 0:
             print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
                   f"removed {n_removed} faces  no boundary — mesh already closed")
             return mesh_cut
 
-        # Collect unique boundary vertex indices
-        boundary_verts_idx = np.unique(boundary)
-        boundary_verts = mesh_cut.vertices[boundary_verts_idx]
+        # Step 3: trace all boundary loops using proper adjacency traversal
+        adj = {}
+        for a, b in boundary.tolist():
+            adj.setdefault(a, []).append(b)
+            adj.setdefault(b, []).append(a)
 
-        # Project them all to exactly z_floor_norm so the cap is planar
-        boundary_verts_projected = boundary_verts.copy()
-        boundary_verts_projected[:, 2] = z_floor_norm
-
-        # Add center vertex at centroid of boundary
-        centroid = boundary_verts_projected.mean(axis=0)
-        new_verts = np.vstack([mesh_cut.vertices,
-                               boundary_verts_projected,
-                               centroid.reshape(1, 3)])
-        n_orig = len(mesh_cut.vertices)
-        n_bnd  = len(boundary_verts_idx)
-        center_idx = n_orig + n_bnd  # index of centroid in new_verts
-
-        # Map original boundary vertex indices → new projected vertex indices
-        old_to_new = {int(old): n_orig + i for i, old in enumerate(boundary_verts_idx)}
-
-        # Build ordered boundary loop(s) by chaining edges
-        edge_map = {}
-        for a, b in boundary:
-            edge_map.setdefault(int(a), []).append(int(b))
-
-        visited = set()
-        cap_faces = []
-        for start in boundary_verts_idx:
-            start = int(start)
-            if start in visited:
+        visited_edges: set = set()
+        loops: list = []
+        for start in list(adj.keys()):
+            # skip if all edges from this vertex already consumed
+            if all((min(start, n), max(start, n)) in visited_edges
+                   for n in adj[start]):
                 continue
-            # Walk the loop
             loop = [start]
-            visited.add(start)
-            cur = start
+            prev, cur = None, start
             while True:
-                nexts = [v for v in edge_map.get(cur, []) if v not in visited]
+                nexts = [n for n in adj[cur]
+                         if (min(cur, n), max(cur, n)) not in visited_edges
+                         and n != prev]
                 if not nexts:
                     break
                 nxt = nexts[0]
-                visited.add(nxt)
+                visited_edges.add((min(cur, nxt), max(cur, nxt)))
+                if nxt == start:
+                    break
                 loop.append(nxt)
-                cur = nxt
+                prev, cur = cur, nxt
+            if len(loop) >= 3:
+                loops.append(loop)
 
-            # Fan triangulate: center → loop[i] → loop[i+1]
-            # Normal should point in +Z (toward bin), so wind counter-clockwise
-            # when viewed from +Z direction.
-            for i in range(len(loop) - 1):
-                a = old_to_new[loop[i]]
-                b = old_to_new[loop[i + 1]]
-                c = center_idx
-                # Ensure outward normal (+Z): cross(B-A, C-A).z > 0
-                va = new_verts[a]
-                vb = new_verts[b]
-                vc = new_verts[c]
-                normal_z = (vb[0]-va[0])*(vc[1]-va[1]) - (vb[1]-va[1])*(vc[0]-va[0])
-                if normal_z > 0:
-                    cap_faces.append([a, b, c])
-                else:
-                    cap_faces.append([a, c, b])
+        if not loops:
+            print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
+                  f"removed {n_removed} faces  no valid loops found")
+            return mesh_cut
 
-        if cap_faces:
-            all_faces = np.vstack([mesh_cut.faces, np.array(cap_faces)])
-            mesh_final = trimesh.Trimesh(vertices=new_verts,
-                                         faces=all_faces, process=False)
-        else:
-            mesh_final = mesh_cut
+        # Step 4: triangulate loops using shapely — filter noise, merge significant loops
+        from shapely.geometry import Polygon as ShapelyPolygon
+        from shapely.ops import unary_union
 
+        # Build shapely polygons from each loop and filter by minimum area.
+        # The boundary at the cut level has many tiny fragments (Poisson noise);
+        # only keep loops whose area > 1% of the largest loop's area.
+        raw_polys = []
+        for loop in loops:
+            xy = mesh_cut.vertices[loop, :2]
+            poly = ShapelyPolygon(xy)
+            if not poly.is_valid:
+                poly = poly.buffer(0)
+            if poly.area > 1e-8:
+                raw_polys.append(poly)
+
+        if not raw_polys:
+            print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
+                  f"removed {n_removed} faces  no valid polygons")
+            return mesh_cut
+
+        max_area = max(p.area for p in raw_polys)
+        significant = [p for p in raw_polys if p.area >= 0.01 * max_area]
+        merged = unary_union(significant).buffer(0)  # merge overlapping, fix topology
+
+        # Triangulate merged polygon (may be MultiPolygon)
+        geoms = list(getattr(merged, "geoms", [merged]))
+        cap_verts_list: list = []
+        cap_faces_list: list = []
+        n_base = len(mesh_cut.vertices)
+        offset = 0
+
+        for poly in geoms:
+            if poly.is_empty or poly.area < 1e-8:
+                continue
+            try:
+                v2d, f2d = trimesh.creation.triangulate_polygon(poly, engine="earcut")
+            except Exception:
+                continue
+            if v2d is None or len(f2d) == 0:
+                continue
+            v3d = np.column_stack([v2d, np.full(len(v2d), z_floor_norm)])
+            cap_verts_list.append(v3d)
+            cap_faces_list.append(f2d + n_base + offset)
+            offset += len(v3d)
+
+        if not cap_faces_list:
+            print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
+                  f"removed {n_removed} faces  triangulation produced no faces")
+            return mesh_cut
+
+        all_verts = np.vstack([mesh_cut.vertices] + cap_verts_list)
+        all_cap_faces = np.vstack(cap_faces_list)
+
+        # Ensure cap normals point outward (+Z toward bin)
+        for i, f in enumerate(all_cap_faces):
+            v = all_verts[f]
+            nz = (v[1,0]-v[0,0])*(v[2,1]-v[0,1]) - (v[1,1]-v[0,1])*(v[2,0]-v[0,0])
+            if nz < 0:
+                all_cap_faces[i] = f[::-1]
+
+        all_faces = np.vstack([mesh_cut.faces, all_cap_faces])
+        mesh_final = trimesh.Trimesh(vertices=all_verts, faces=all_faces, process=False)
+
+        n_cap = len(all_cap_faces)
         print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
-              f"removed {n_removed} faces  cap +{len(cap_faces)} faces  "
+              f"removed {n_removed} faces  {len(loops)} loop(s)  cap +{n_cap} faces  "
               f"watertight={mesh_final.is_watertight}")
         return mesh_final
     except Exception as e:
+        import traceback; traceback.print_exc()
         print(f"      floor cap: failed ({e}) — returning original mesh")
         return mesh
 
