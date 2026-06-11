@@ -38,8 +38,21 @@ RUN pip install --no-cache-dir \
     'pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git' || \
     echo "WARNING: pytorch3d build failed — ManifoldnessConstraint will not work"
 
-# ── 6. Pipeline modules ───────────────────────────────────────────────────────
-COPY pointcloud_utils.py mesh_utils.py sdf_generator.py pipeline.py /app/
+# ── 6. nksr — Neural Kernel Surface Reconstruction (build from source) ───────
+# nksr wheel server (nksr.huangjh.tech) was discontinued; build from the repo.
+# setup.py downloads OpenVDB + Eigen at build time and compiles CUDA extensions.
+# --no-build-isolation: uses the installed torch (2.1.0) instead of re-downloading.
+# torch-scatter required by nksr Python code; wheel keyed to torch+cu version.
+RUN pip install --no-cache-dir \
+    torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
+# gitpython needed by nksr setup.py to download OpenVDB + Eigen at build time
+RUN pip install --no-cache-dir gitpython
+COPY nksr/package/ /opt/nksr/
+RUN pip install --no-cache-dir --no-build-isolation /opt/nksr/ || \
+    echo "WARNING: nksr build failed — noksr method will use BPA fallback"
+
+# ── 7. Pipeline modules ───────────────────────────────────────────────────────
+COPY pointcloud_utils.py mesh_utils.py sdf_generator.py pipeline.py remesh.py /app/
 
 # ── 7. Runtime environment ────────────────────────────────────────────────────
 # Weights downloaded once on host: python tools/download_models_numcc.py

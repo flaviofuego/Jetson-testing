@@ -7,3 +7,9 @@
 [submodule "depth-anything-3"]
 	path = depth-anything-3
 	url = https://github.com/bytedance-seed/depth-anything-3.git
+[submodule "numcc/nksr"]
+	path = numcc/nksr
+	url = https://github.com/nv-tlabs/nksr.git
+[submodule "aira"]
+	path = aira
+	url = https://github.com/UnderJollyRogers/AIRA

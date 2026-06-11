@@ -314,6 +314,76 @@ def run_numcc(
     return np.concatenate(refined, axis=0)
 
 
+def _points_to_mesh_noksr(surface_pts: np.ndarray) -> "trimesh.Trimesh":
+    """Surface reconstruction with nksr (Neural Kernel Surface Reconstruction).
+
+    nksr learns a kernel-based implicit field — handles noisy/sparse clouds better
+    than Poisson because it incorporates a learned prior over surface shapes.
+    No pretrained checkpoint needed; uses a GPU kernel solver at runtime.
+
+    Fallback (when nksr not installed): Ball-Pivoting Algorithm (BPA) via Open3D.
+    BPA is also different from Poisson — it rolls a virtual sphere over the point
+    cloud and creates faces where the sphere touches 3 points simultaneously, so
+    it stays closer to the actual input points rather than fitting a smooth implicit.
+    """
+    import trimesh
+    import open3d as o3d
+
+    # ── prepare normals (needed by both nksr and BPA) ────────────────────────
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(surface_pts)
+    extent = surface_pts.max(axis=0) - surface_pts.min(axis=0)
+    density = len(surface_pts) / max(float(np.prod(extent)), 1e-6)
+    radius_n = float((1.0 / density) ** (1 / 3)) * 3.0
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius_n, max_nn=50)
+    )
+    pcd.orient_normals_consistent_tangent_plane(30)
+
+    # ── attempt nksr ──────────────────────────────────────────────────────────
+    try:
+        import torch
+        import nksr
+        # Verify this is the real nksr (stub from PyPI has no Reconstructor)
+        if not hasattr(nksr, "Reconstructor"):
+            raise ImportError("nksr stub installed (PyPI placeholder) — real wheel unavailable")
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        pts_t     = torch.from_numpy(surface_pts).float().to(device)
+        normals   = np.asarray(pcd.normals).astype(np.float32)
+        normals_t = torch.from_numpy(normals).float().to(device)
+
+        reconstructor = nksr.Reconstructor(device)
+        # detail_level: higher → finer octree (1.0 default, 2.0 = ~4× more cells)
+        field     = reconstructor.reconstruct(pts_t, normal=normals_t, detail_level=1.0)
+        mesh_nksr = field.extract_dual_mesh(mise_iter=1)
+
+        verts = mesh_nksr.v.cpu().numpy()
+        faces = mesh_nksr.f.cpu().numpy()
+        print(f"       nksr: {len(verts)} verts, {len(faces)} faces")
+        return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+    except ImportError as e:
+        print(f"      nksr unavailable ({e}) — using BPA (Ball-Pivoting Algorithm)")
+    except Exception as e:
+        print(f"      nksr failed ({e}) — using BPA (Ball-Pivoting Algorithm)")
+
+    # ── fallback: Ball-Pivoting Algorithm (open3d) ───────────────────────────
+    # BPA radius: ~2× average spacing so the ball bridges neighbouring points.
+    distances = np.asarray(pcd.compute_nearest_neighbor_distance())
+    avg_dist  = float(np.mean(distances))
+    radii     = [avg_dist * 2.0, avg_dist * 4.0]   # two passes: fine + coarse
+    mesh_bpa  = o3d.geometry.TriangleMesh.create_from_point_cloud_ball_pivoting(
+        pcd, o3d.utility.DoubleVector(radii)
+    )
+    mesh_bpa.remove_degenerate_triangles()
+    mesh_bpa.remove_duplicated_vertices()
+    verts = np.asarray(mesh_bpa.vertices)
+    faces = np.asarray(mesh_bpa.triangles)
+    print(f"       BPA: {len(verts)} verts, {len(faces)} faces  (avg spacing={avg_dist:.4f})")
+    return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+
 def _points_to_mesh(surface_pts: np.ndarray, poisson_depth: int = 10) -> "trimesh.Trimesh":
     """Convert surface point cloud to mesh via Poisson reconstruction (open3d).
 
@@ -450,6 +520,12 @@ def main():
                              "n_side=cbrt(n_query) per axis). More→denser surface coverage.")
     parser.add_argument("--poisson-depth", default=10, type=int,
                         help="Poisson reconstruction octree depth (default: 10; 9=coarse, 11=fine)")
+    parser.add_argument("--mesh-method", default="poisson",
+                        choices=["poisson", "noksr", "both"],
+                        help="Mesh reconstruction method: poisson (Open3D Poisson, default), "
+                             "noksr (nksr Neural Kernel Surface Reconstruction), "
+                             "both (run both and save {name}_poisson.obj + {name}_noksr.obj "
+                             "for quality comparison; {name}.obj uses noksr)")
     args = parser.parse_args()
 
     if args.intrinsics is None and any(v is None for v in [args.fx, args.fy, args.cx, args.cy]):
@@ -559,15 +635,41 @@ def main():
     _save_ply(numcc_ply, surface_pts)
     print(f"      PLY saved: {numcc_ply}")
 
-    print("[4b/6] Meshing surface points (Poisson reconstruction)...")
-    raw_mesh = _points_to_mesh(surface_pts, poisson_depth=args.poisson_depth)
-    print(f"       Raw mesh: {len(raw_mesh.faces)} faces")
+    use_noksr  = args.mesh_method in ("noksr", "both")
+    use_poisson = args.mesh_method in ("poisson", "both")
 
-    print("[5/6] Normalizing mesh (longest axis -> 20 cm)...")
+    raw_mesh_poisson = None
+    raw_mesh_noksr   = None
+
+    if use_poisson:
+        print("[4b/6] Meshing surface points (Poisson reconstruction)...")
+        raw_mesh_poisson = _points_to_mesh(surface_pts, poisson_depth=args.poisson_depth)
+        print(f"       Poisson raw mesh: {len(raw_mesh_poisson.faces)} faces")
+
+    if use_noksr:
+        print("[4b/6] Meshing surface points (nksr — Neural Kernel Surface Reconstruction)...")
+        raw_mesh_noksr = _points_to_mesh_noksr(surface_pts)
+        print(f"       nksr raw mesh: {len(raw_mesh_noksr.faces)} faces")
+
+    # Primary mesh: noksr when available, else poisson
+    raw_mesh = raw_mesh_noksr if raw_mesh_noksr is not None else raw_mesh_poisson
+
+    print("[5/6] Normalizing mesh(es) (longest axis -> 20 cm)...")
     mesh = normalize_mesh(raw_mesh)
     obj_path = asset_dir / f"{args.name}.obj"
     mesh.export(str(obj_path))
-    print(f"      Saved: {obj_path}  ({len(mesh.faces)} faces)")
+    method_label = "noksr" if raw_mesh_noksr is not None else "poisson"
+    print(f"      Saved: {obj_path}  ({len(mesh.faces)} faces)  [{method_label}]")
+
+    if args.mesh_method == "both":
+        # Save individual comparison files before normalization scaling is lost
+        for label, rm in [("poisson", raw_mesh_poisson), ("noksr", raw_mesh_noksr)]:
+            if rm is None:
+                continue
+            m_norm = normalize_mesh(rm)
+            cmp_path = asset_dir / f"{args.name}_{label}.obj"
+            m_norm.export(str(cmp_path))
+            print(f"      Saved comparison: {cmp_path}  ({len(m_norm.faces)} faces)")
 
     print("[5b/6] Convex decomposition...")
     try:
@@ -589,7 +691,10 @@ def main():
     print(f"      Saved: {sdf_path}")
 
     print(f"\nDone -> {asset_dir}/  ({time.time() - t_start:.1f}s total)")
-    print(f"  {args.name}.obj")
+    print(f"  {args.name}.obj  [{method_label}]")
+    if args.mesh_method == "both":
+        print(f"  {args.name}_poisson.obj")
+        print(f"  {args.name}_noksr.obj")
     print(f"  {args.name}.sdf")
     print(f"  {args.name}_numcc_surface.ply  ← raw NU-MCC output (normalized space)")
     print(f"  {args.name}_object_cloud.ply   ← depth back-projection (metric space)")

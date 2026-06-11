@@ -51,15 +51,19 @@ trellis/
   requirements.txt
 numcc/
   Dockerfile.x86        # GPU x86 — base pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
-  pipeline.py           # depth → P2C → NU-MCC → surface pts → Poisson → coacd → SDF
+  pipeline.py           # depth → P2C → NU-MCC → surface pts → mesh → coacd → SDF
+  remesh.py             # mesh-only desde PLY existente (salta NU-MCC) — corre dentro de Docker
   pointcloud_utils.py   # back-projection depth → nube de puntos
   mesh_utils.py
   sdf_generator.py
   requirements.txt
+  nksr/                 # submodulo nv-tlabs/nksr — Neural Kernel Surface Reconstruction
 dvlt.cu/                # submodulo — reconstrucción 3D gaussiana
   run_dvlt.sh           # wrapper para correr dvlt con una carpeta de imágenes
 tools/
   generate_asset.py         # wrapper principal (soporta sam2, triposr, trellis, numcc)
+  run_numcc.py              # wrapper numcc: full pipeline o solo remesh, elige nksr/poisson
+  run_pipeline_da3_numcc_drake.py  # pipeline completo DA3 → SAM2 → numcc → Drake
   download_models.py        # descarga modelos TripoSR en la Jetson
   download_models_trellis.py        # descarga modelos TRELLIS en la Jetson
   download_models_numcc.py          # descarga pesos P2C (Google Drive) y NU-MCC (S3)
@@ -146,19 +150,28 @@ python3 tools/download_models_numcc.py
 # → ~/models/numcc/p2c/p2c_checkpoint.pth  (1.9 GB, Google Drive)
 # → ~/models/numcc/numcc/numcc_checkpoint.pth  (2.4 GB, S3)
 
-# Construir imagen Docker (una sola vez, ~10 min)
+# Construir imagen Docker (una sola vez, ~15 min — compila nksr + P2C CUDA extensions)
 docker build -t numcc:x86 -f numcc/Dockerfile.x86 numcc/
 
-# Generar asset desde depth map (via generate_asset.py — sin soporte --mask)
-python3 tools/generate_asset.py --model numcc \
-    --depth data/depth.npy \
-    --color data/color.npy \
-    --intrinsics data/intrinsics.json \
-    --name nombre_objeto
+# Pipeline completo desde foto + depth map
+python3 tools/run_numcc.py \
+    --image  data/images/objeto.jpg \
+    --depth  data/outputs/pipeline/objeto/numcc_input/depth_full.npy \
+    --name   objeto \
+    --intrinsics data/outputs/pipeline/objeto/numcc_input/intrinsics.json \
+    --mask   data/outputs/pipeline/objeto/numcc_input/mask.npy \
+    --mesh-method noksr          # o poisson
 
-# Correr directamente via Docker (soporta --mask para máscara SAM2)
+# Solo remesh desde nube de puntos existente (salta NU-MCC, muy rápido)
+python3 tools/run_numcc.py \
+    --cloud  assets/objeto/objeto/objeto_numcc_surface.ply \
+    --name   objeto \
+    --mesh-method noksr
+
+# Correr Docker directamente (máximo control)
 docker run --rm --gpus all \
     -v ~/models/numcc:/opt/models:ro \
+    -v ~/models/nksr_cache:/root/.cache/torch \
     -v "$(pwd)/data/outputs/pipeline/nombre/numcc_input":/input:ro \
     -v "$(pwd)/assets":/output \
     numcc:x86 \
@@ -167,8 +180,9 @@ docker run --rm --gpus all \
     --mask  /input/mask.npy \
     --intrinsics /input/intrinsics.json \
     --name nombre_objeto \
-    --output /output/nombre_objeto \
-    --udf-threshold 0.10
+    --output /output \
+    --mesh-method noksr \
+    --udf-threshold 0.23
 ```
 
 **Formatos aceptados:**
@@ -178,7 +192,7 @@ docker run --rm --gpus all \
 
 **Intrínsecas de la cámara Drake (AIRA):** fx=fy=579.41, cx=319.5, cy=239.5 (imagen 640×480, FOV 45°)
 
-**Mount de modelos:** el pipeline espera `/opt/models` dentro del container — montar como `~/models/numcc:/opt/models:ro`. El `generate_asset.py` ya lo hace; si se corre Docker manualmente usar exactamente esa ruta.
+**Mount de modelos:** el pipeline espera `/opt/models` dentro del container — montar como `~/models/numcc:/opt/models:ro`. Montar también `~/models/nksr_cache:/root/.cache/torch` para cachear el checkpoint nksr (~55 MB, se descarga de HuggingFace la primera vez).
 
 **Nota sobre el checkpoint P2C:** el archivo descargado (`p2c_checkpoint.pth`) es un ZIP con checkpoints por categoría ShapeNet (plane/car/chair/lamp/sofa/table/watercraft/cabinet). No corresponde a la arquitectura P2C de CuiRuikai. El pipeline tiene fallback gracioso — si `load_state_dict` falla, pasa la nube de depth directamente a NU-MCC sin completar.
 
@@ -186,7 +200,7 @@ docker run --rm --gpus all \
 - `n_groups=200` (shape de init_embedding en el checkpoint)
 - `nneigh=4` — vecinos de anclaje que el decoder atiende (training default; usar 45 rompe la distribución de atención)
 - `nn_seen=4` — vecinos de seen_xyz por query point (training default; -1 → OOM de 95 GiB)
-- `udf_threshold=0.23` — threshold de training (0.05 descartaba casi todos los puntos válidos; con 0.23 se obtienen ~10K candidatos)
+- `udf_threshold=0.23` — threshold de training (0.05 descartaba casi todos los puntos válidos; con 0.23 se obtienen ~40K candidatos)
 - `repulsive=1` — fuerzas repulsivas activas en `move_points`
 - `seen_xyz`: mapa XYZ 2D `(B, 112, 112, 3)` normalizado a zero-mean/unit-std; inválidos = `float('inf')`
 - `seen_images`: 800×800 obligatorio (assert en preprocess_img); canal alpha eliminado si RGBA
@@ -194,15 +208,28 @@ docker run --rm --gpus all \
 
 **`move_points` es crítico:** después del filtro por UDF threshold, cada punto candidato se refina por descenso de gradiente sobre el campo UDF (`udf_n_iter=3` iteraciones). Sin esto la superficie es muy escasa e irregular.
 
+**Métodos de reconstrucción de mesh (`--mesh-method`):**
+
+| Método | Faces típicas | Descripción |
+|--------|--------------|-------------|
+| `noksr` (default) | ~260K | nksr Neural Kernel Surface Reconstruction — prior aprendido, mejor en zonas dispersas |
+| `poisson` | ~140K | Open3D Screened Poisson — más suave, menor conteo de caras, más rápido |
+
+nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resultado tiene mayor resolución geométrica pero CoACD genera más partes convexas. Para Drake, ambos son válidos — usar `poisson` si se necesitan menos partes CoACD.
+
 **Outputs en `assets/<nombre>/`:**
-- `<nombre>.obj` — mesh Poisson (~30 K caras con imagen única y parámetros correctos)
+- `<nombre>.obj` — mesh final (método elegido)
 - `<nombre>.sdf` — listo para Drake
 - `<nombre>_numcc_surface.ply` — nube bruta de NU-MCC (espacio normalizado, antes del mesh)
-- `<nombre>_object_cloud.ply` — back-projection del depth (espacio métrico, antes de NU-MCC)
+- `<nombre>_object_cloud.ply` — back-projection del depth (espacio métrico, antes de NU-MCC, con colores RGB)
 - `<nombre>_pointcloud.npy` — nube de puntos P2C completada
 - `<nombre>_parts/` — piezas CoACD
 
-**Tiempo típico (RTX 4000 Ada, 20 GB):** ~20–28s
+**Tiempo típico (RTX 4000 Ada, 20 GB):**
+- Pipeline completo (NU-MCC + nksr): ~70–100s
+- Pipeline completo (NU-MCC + poisson): ~45–60s
+- Solo remesh desde PLY (nksr): ~15–20s
+- Solo remesh desde PLY (poisson): ~5–10s
 
 ### Pipeline completo DA3 → SAM2 → numcc → Drake
 
@@ -325,6 +352,7 @@ Los modelos se guardan en el host y se montan en Docker:
 | dvlt weights | `~/dvlt.cu/model/` | ~468 MB |
 | P2C checkpoint (zip categorías) | `~/models/numcc/p2c/` | 1.9 GB |
 | NU-MCC CO3D-V2 (udf-ep99.pth) | `~/models/numcc/numcc/` | 2.4 GB |
+| nksr checkpoint (ks.pth) | `~/models/nksr_cache/torch/hub/checkpoints/` | 55 MB |
 
 ## Optimizaciones activas (TripoSR)
 
@@ -337,7 +365,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - Docker usa `--runtime=nvidia` (no `--gpus all`) en esta Jetson
 - Los assets generados por Docker son propiedad de root — usar `sudo chown -R jetson:jetson ~/Jetson-testing/assets` si hay problemas de permisos
 - El entorno `pyproject.toml` (uv/Drake) es independiente — NO incluye TripoSR ni TRELLIS (conflictos de versiones)
-- `dvlt.cu`, `depth-anything-3` y `sam2` son submódulos git — clonar con `git clone --recurse-submodules`
+- `dvlt.cu`, `depth-anything-3`, `sam2` y `numcc/nksr` son submódulos git — clonar con `git clone --recurse-submodules`
 - `git config --global submodule.recurse true` para que pull/fetch actualice submódulos automáticamente
 - `sam2` es un fork de `facebookresearch/sam2` en `cristian10gf/sam2`
 - DA3 instalado en el venv de UniWhere (`/home/worker-node-4/Documents/GitHub/UniWhere/.venv`), no tiene venv propio
@@ -347,5 +375,9 @@ Los modelos se guardan en el host y se montan en Docker:
 - numcc usa `--gpus all` (x86), no `--runtime=nvidia` (Jetson). El `generate_asset.py` ya lo maneja automáticamente según el modelo
 - numcc Dockerfile usa imagen `-devel` (no `-runtime`) para tener nvcc y compilar extensiones CUDA (chamfer_dist, pointops) en build time; requiere `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"` y `numpy<2`
 - numcc `pipeline.py` tiene ENTRYPOINT — al correr Docker los argumentos van directo, sin `python3 /app/pipeline.py` delante
-- `generate_asset.py` no soporta `--mask` para numcc — para pasar máscara SAM2 correr Docker manualmente (ver sección numcc)
+- numcc `remesh.py` requiere `--entrypoint python3` para activarse: `docker run --entrypoint python3 numcc:x86 /app/remesh.py ...`
+- `generate_asset.py` no soporta `--mask` para numcc — usar `tools/run_numcc.py` o Docker directamente
+- nksr submodulo en `numcc/nksr/` (nv-tlabs/nksr) — se compila en Docker build desde `numcc/nksr/package/setup.py` con `--no-build-isolation`; requiere `gitpython` para descargar OpenVDB + Eigen durante el build; tiempo de compilación ~4 min
+- nksr wheel server (`nksr.huangjh.tech`) está permanentemente caído (NXDOMAIN); el submodulo es la única vía de instalación
+- nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — montar `~/models/nksr_cache:/root/.cache/torch` para no re-descargarlo en cada container
 - El gitignore cubre `/assets/` — ningún asset generado se commitea
