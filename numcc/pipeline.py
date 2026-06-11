@@ -902,10 +902,12 @@ def main():
         print("[4d/6] Clipping lateral excess via SAM2 mask silhouette...")
         if raw_mesh_poisson is not None:
             raw_mesh_poisson = _clip_by_mask_silhouette(
-                raw_mesh_poisson, norm_center, norm_scale, fx, fy, cx, cy, seen_mask)
+                raw_mesh_poisson, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
+                dilation_px=5)
         if raw_mesh_noksr is not None:
             raw_mesh_noksr = _clip_by_mask_silhouette(
-                raw_mesh_noksr, norm_center, norm_scale, fx, fy, cx, cy, seen_mask)
+                raw_mesh_noksr, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
+                dilation_px=5)
 
     # Primary mesh: noksr when available, else poisson
     raw_mesh = raw_mesh_noksr if raw_mesh_noksr is not None else raw_mesh_poisson
