@@ -897,11 +897,11 @@ def main():
         if raw_mesh_poisson is not None:
             raw_mesh_poisson = _clip_by_mask_silhouette(
                 raw_mesh_poisson, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
-                dilation_px=5)
+                dilation_px=0)
         if raw_mesh_noksr is not None:
             raw_mesh_noksr = _clip_by_mask_silhouette(
                 raw_mesh_noksr, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
-                dilation_px=5)
+                dilation_px=0)
 
     # ── floor cap: cut at support plane + add contour-following cap ──────────
     if z_floor_norm is not None:
