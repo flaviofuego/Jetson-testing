@@ -406,7 +406,10 @@ def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "tr
 
         max_area = max(p.area for p in raw_polys)
         significant = [p for p in raw_polys if p.area >= 0.01 * max_area]
-        merged = unary_union(significant).buffer(0)  # merge overlapping, fix topology
+        # Expand each polygon slightly to bridge boundary gaps left by Poisson slicing,
+        # merge into one shape, then shrink back to original size.
+        buf = max_area ** 0.5 * 0.05   # 5% of the characteristic length
+        merged = unary_union([p.buffer(buf) for p in significant]).buffer(-buf * 0.5).buffer(0)
 
         # Triangulate merged polygon (may be MultiPolygon)
         geoms = list(getattr(merged, "geoms", [merged]))
