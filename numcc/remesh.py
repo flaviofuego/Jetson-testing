@@ -20,7 +20,10 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, "/app")
-from pipeline import _points_to_mesh, _points_to_mesh_noksr
+from pipeline import (
+    _points_to_mesh, _points_to_mesh_noksr, _points_to_mesh_sap,
+    _points_to_mesh_lwmr,
+)
 from mesh_utils import normalize_mesh, decompose_convex
 from sdf_generator import generate_sdf
 
@@ -34,11 +37,23 @@ def main():
     p.add_argument("--output",       required=True, type=Path,
                    help="Output directory — files saved to OUTPUT/NAME/")
     p.add_argument("--mesh-method",  default="noksr",
-                   choices=["poisson", "noksr"],
-                   help="Mesh reconstruction method: noksr (nksr Neural Kernel, default) "
-                        "or poisson (Open3D Screened Poisson)")
+                   choices=["poisson", "noksr", "sap", "lwmr"],
+                   help="Mesh reconstruction method: noksr (nksr Neural Kernel, default), "
+                        "poisson (Open3D Screened Poisson), "
+                        "sap (Shape As Points / DPSR — fast spectral Poisson), "
+                        "lwmr (LightweightMR CVPR 2025 — low-poly, ~10-30 min)")
     p.add_argument("--poisson-depth", default=10, type=int,
                    help="Poisson octree depth (default 10; 9=coarse, 11=fine)")
+    p.add_argument("--sap-grid-res", default=256, type=int,
+                   help="SAP/DPSR grid resolution (default 256)")
+    p.add_argument("--sap-sigma", default=2.0, type=float,
+                   help="SAP/DPSR Gaussian smoothing (default 2.0)")
+    p.add_argument("--lwmr-sdf-iters", default=20_000, type=int,
+                   help="LightweightMR SDF iterations (default 20000)")
+    p.add_argument("--lwmr-vg-iters", default=8_000, type=int,
+                   help="LightweightMR vertex-generation iterations (default 8000)")
+    p.add_argument("--lwmr-vertices", default=3_400, type=int,
+                   help="LightweightMR output vertex count (default 3400)")
     args = p.parse_args()
 
     t0 = time.time()
@@ -58,6 +73,15 @@ def main():
     if args.mesh_method == "noksr":
         print("Meshing with nksr (Neural Kernel Surface Reconstruction)...")
         raw_mesh = _points_to_mesh_noksr(surface_pts)
+    elif args.mesh_method == "sap":
+        print(f"Meshing with SAP/DPSR (grid {args.sap_grid_res}^3)...")
+        raw_mesh = _points_to_mesh_sap(surface_pts, grid_res=args.sap_grid_res,
+                                       sigma=args.sap_sigma)
+    elif args.mesh_method == "lwmr":
+        print("Meshing with LightweightMR (per-object optimization, slow)...")
+        raw_mesh = _points_to_mesh_lwmr(
+            surface_pts, args.name, sdf_iters=args.lwmr_sdf_iters,
+            vg_iters=args.lwmr_vg_iters, vertices_size=args.lwmr_vertices)
     else:
         print(f"Meshing with Poisson (depth={args.poisson_depth})...")
         raw_mesh = _points_to_mesh(surface_pts, poisson_depth=args.poisson_depth)

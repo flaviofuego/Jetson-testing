@@ -288,6 +288,20 @@ def run_numcc(
                 (W_orig, H_orig), PILImage.NEAREST
             )
             mask_full = np.asarray(m_img) > 0
+        # Erode 2 px: monocular depth (DA3) bleeds at silhouettes, leaving flying
+        # pixels on the object boundary that corrupt the normalization stats and
+        # the encoder input. demo_iphone.py gets an equivalent erosion for free —
+        # its bilinear resize propagates inf into every border pixel.
+        from scipy.ndimage import binary_erosion
+        mask_eroded = binary_erosion(mask_full, structure=np.ones((3, 3), bool),
+                                     iterations=2)
+        if mask_eroded.sum() >= 64:  # guard: tiny masks would vanish
+            n_removed = int(mask_full.sum() - mask_eroded.sum())
+            mask_full = mask_eroded
+            print(f"      mask erosion: removed {n_removed} boundary px "
+                  f"({int(mask_full.sum())} object px remain)")
+        else:
+            print("      mask erosion skipped — object too small")
         xyz_full[~mask_full] = np.nan  # background pixels → invalid
 
     # ── normalize seen_xyz — matches demo_iphone.py normalize() ──────────────
@@ -689,6 +703,215 @@ def _points_to_mesh_noksr(surface_pts: np.ndarray) -> "trimesh.Trimesh":
     return trimesh.Trimesh(vertices=verts, faces=faces, process=False)
 
 
+def _estimate_oriented_normals(surface_pts: np.ndarray):
+    """Open3D point cloud with consistently-oriented normals (shared helper)."""
+    import open3d as o3d
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(surface_pts)
+    extent = surface_pts.max(axis=0) - surface_pts.min(axis=0)
+    density = len(surface_pts) / max(float(np.prod(extent)), 1e-6)
+    radius_n = float((1.0 / density) ** (1 / 3)) * 3.0
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius_n, max_nn=50)
+    )
+    pcd.orient_normals_consistent_tangent_plane(30)
+    return pcd
+
+
+def _points_to_mesh_sap(
+    surface_pts: np.ndarray,
+    grid_res: int = 256,
+    sigma: float = 2.0,
+) -> "trimesh.Trimesh":
+    """Shape As Points — Differentiable Poisson Surface Reconstruction (DPSR).
+
+    Peng et al., NeurIPS 2021 (github.com/autonomousvision/shape_as_points).
+    Single spectral solve, no per-shape optimization and no checkpoint:
+      1. estimate oriented normals (Open3D, same recipe as the other methods)
+      2. splat point normals onto a regular grid (trilinear rasterization)
+      3. solve the Poisson equation in the Fourier domain:
+           chi_hat(k) = (i k · v_hat(k)) / -|k|^2,  smoothed by a Gaussian
+      4. shift the indicator so the iso-surface passes through the input points
+      5. marching cubes at level 0
+
+    Much faster than Open3D's octree Poisson at comparable quality on uniform
+    clouds (NU-MCC's repulsive output is uniform — the ideal case), and the
+    grid resolution directly bounds the output face count.
+    """
+    import torch
+    import trimesh
+
+    pcd = _estimate_oriented_normals(surface_pts)
+    normals = np.asarray(pcd.normals).astype(np.float32)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    pts = torch.from_numpy(surface_pts.astype(np.float32)).to(device)   # (N, 3)
+    nrm = torch.from_numpy(normals).to(device)                          # (N, 3)
+
+    # ── map points into [0,1)^3 with 5% padding ──────────────────────────────
+    p_min = pts.min(dim=0).values
+    p_max = pts.max(dim=0).values
+    scale = float((p_max - p_min).max()) / 0.9
+    origin = p_min - 0.05 * scale
+    pts01 = (pts - origin) / scale                                       # (N, 3) in [0,1)
+
+    # ── trilinear rasterization of the normal field onto the grid ────────────
+    R = grid_res
+    g = torch.zeros(3, R, R, R, device=device)
+    base = pts01 * R - 0.5
+    i0 = torch.floor(base).long()                                        # (N, 3)
+    frac = base - i0.float()
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                idx = i0 + torch.tensor([dx, dy, dz], device=device)
+                idx = idx.clamp(0, R - 1)
+                w = (
+                    (frac[:, 0] if dx else 1 - frac[:, 0])
+                    * (frac[:, 1] if dy else 1 - frac[:, 1])
+                    * (frac[:, 2] if dz else 1 - frac[:, 2])
+                )                                                        # (N,)
+                flat = idx[:, 0] * R * R + idx[:, 1] * R + idx[:, 2]     # (N,)
+                for c in range(3):
+                    g[c].view(-1).index_add_(0, flat, w * nrm[:, c])
+
+    # ── spectral Poisson solve: chi_hat = (i omega · v_hat) / -|omega|^2 ─────
+    v_hat = torch.fft.fftn(g, dim=(1, 2, 3))                             # (3, R, R, R)
+    k = torch.fft.fftfreq(R, d=1.0 / R, device=device)                   # integer freqs
+    omega = 2 * np.pi * k                                                # spatial freqs in [0,1) domain
+    wx = omega.view(R, 1, 1)
+    wy = omega.view(1, R, 1)
+    wz = omega.view(1, 1, R)
+    lap = wx**2 + wy**2 + wz**2
+    lap[0, 0, 0] = 1.0  # avoid div-by-zero at DC (set chi_hat DC to 0 below)
+
+    div_hat = 1j * (wx * v_hat[0] + wy * v_hat[1] + wz * v_hat[2])
+    gauss = torch.exp(-2.0 * (sigma * np.pi) ** 2 * (lap / (2 * np.pi * R) ** 2))
+    chi_hat = (div_hat / -lap) * gauss
+    chi_hat[0, 0, 0] = 0.0
+    chi = torch.fft.ifftn(chi_hat, dim=(0, 1, 2)).real                   # (R, R, R)
+
+    # ── shift so the zero level passes through the input points ─────────────
+    ip = (pts01 * R).long().clamp(0, R - 1)
+    iso = chi[ip[:, 0], ip[:, 1], ip[:, 2]].mean()
+    field = (chi - iso).cpu().numpy()
+
+    # ── marching cubes at level 0 ─────────────────────────────────────────────
+    try:
+        import mcubes
+        verts, faces = mcubes.marching_cubes(field.astype(np.float64), 0.0)
+    except ImportError:
+        from skimage.measure import marching_cubes as _sk_mc
+        verts, faces, _, _ = _sk_mc(field.astype(np.float32), level=0.0)
+
+    # grid coords → normalized (NU-MCC) space
+    verts = (verts + 0.5) / R * scale + origin.cpu().numpy()
+    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+
+    # Orientation: indicator is positive inside or outside depending on normal
+    # orientation — flip faces if the signed volume came out negative.
+    if mesh.volume < 0:
+        mesh.invert()
+    # Keep only the largest connected component (spectral solve can leave
+    # small floating shells near the domain boundary).
+    comps = mesh.split(only_watertight=False)
+    if len(comps) > 1:
+        mesh = max(comps, key=lambda m: len(m.faces))
+    print(f"       SAP/DPSR: {len(mesh.vertices)} verts, {len(mesh.faces)} faces "
+          f"(grid {R}^3, sigma={sigma})")
+    return mesh
+
+
+def _points_to_mesh_lwmr(
+    surface_pts: np.ndarray,
+    name: str,
+    sdf_iters: int = 20_000,
+    vg_iters: int = 8_000,
+    vertices_size: int = 3_400,
+) -> "trimesh.Trimesh":
+    """LightweightMR — High-Fidelity Lightweight Mesh Reconstruction (CVPR 2025).
+
+    Zhang et al. (github.com/CharizardChenZhang/LightweightMR). Two per-shape
+    optimization stages followed by Delaunay meshing:
+      1. run_sdf.py  — fit a neural SDF to the point cloud (sdf_iters steps)
+      2. run_vg.py   — optimize curvature-adaptive vertices on the SDF
+                       (vg_iters steps, exactly `vertices_size` vertices)
+      3. CGAL Delaunay triangulation + graph-cut labeling → final mesh
+
+    Produces low-face-count meshes that keep high-curvature detail — no
+    decimation pass needed afterwards. CAVEAT: per-object optimization, takes
+    ~10-30 min on a desktop GPU (vs seconds for poisson/sap/noksr).
+    Requires the LightweightMR repo + compiled CGAL binaries at /opt/lwmr
+    (built in Dockerfile.x86).
+    """
+    import re
+    import shutil
+    import subprocess
+    import sys as _sys
+    import tempfile
+    import trimesh
+
+    lwmr_root = Path("/opt/lwmr")
+    delaunay_bin = lwmr_root / "models/delaunay_meshing/create_delaunay/create_delaunay"
+    if not lwmr_root.exists() or not delaunay_bin.exists():
+        raise RuntimeError(
+            "LightweightMR not available in this image (missing /opt/lwmr or its "
+            "CGAL binaries) — rebuild numcc:x86 with the lwmr Dockerfile section."
+        )
+
+    work = Path(tempfile.mkdtemp(prefix="lwmr_"))
+    datadir = work / "data"
+    expdir = work / "exp"
+    datadir.mkdir(parents=True)
+    expdir.mkdir(parents=True)
+    _save_ply(datadir / f"{name}.ply", surface_pts.astype(np.float32))
+
+    # Patch the reference confs: iteration counts, and save_freq must equal
+    # maxiter so the final checkpoint gets the name we pass to the next stage.
+    sdf_conf = (lwmr_root / "confs/sdf.conf").read_text()
+    sdf_conf = re.sub(r"maxiter\s*=\s*[\d_]+", f"maxiter = {sdf_iters}", sdf_conf)
+    sdf_conf = re.sub(r"save_freq\s*=\s*[\d_]+", f"save_freq = {sdf_iters}", sdf_conf)
+    (work / "sdf.conf").write_text(sdf_conf)
+
+    vg_conf = (lwmr_root / "confs/vg.conf").read_text()
+    vg_conf = re.sub(r"maxiter\s*=\s*[\d_]+", f"maxiter = {vg_iters}", vg_conf)
+    vg_conf = re.sub(r"save_freq\s*=\s*[\d_]+", f"save_freq = {vg_iters}", vg_conf)
+    vg_conf = re.sub(r"vertices_size\s*=\s*[\d_]+",
+                     f"vertices_size = {vertices_size}", vg_conf)
+    (work / "vg.conf").write_text(vg_conf)
+
+    # Both scripts resolve ./models/... relative paths — must run from the repo.
+    def _run(script: str, mode: str, extra: list[str]):
+        cmd = [_sys.executable, script, "--mode", mode, "--gpu", "0",
+               "--datadir", f"{datadir}/", "--expdir", f"{expdir}/",
+               "--dataname", name] + extra
+        print(f"       lwmr: {script} --mode {mode} ...")
+        subprocess.run(cmd, cwd=str(lwmr_root), check=True)
+
+    try:
+        _run("run_sdf.py", "train",
+             ["--conf", str(work / "sdf.conf"), "--subdatadir", "SDF"])
+        sdf_ckpt = f"ckpt_{sdf_iters:0>6d}.pth"
+        vg_common = ["--conf", str(work / "vg.conf"), "--subdatadir", "VG",
+                     "--sdf_subdatadir", "SDF", "--sdf_checkpoint_name", sdf_ckpt]
+        _run("run_vg.py", "train", vg_common)
+        _run("run_vg.py", "validate_mesh_delaunay",
+             vg_common + ["--checkpoint_name", f"ckpt_{vg_iters:0>6d}.pth"])
+
+        mesh_dir = expdir / name / "VG" / "delaunay_mesh"
+        candidates = sorted(mesh_dir.glob("*_mesh_sdf*.ply"))
+        if not candidates:
+            raise RuntimeError(f"LightweightMR produced no mesh in {mesh_dir}")
+        # validate_mesh_delaunay already re-applies the dataset loc/scale, so the
+        # mesh comes back in our input (NU-MCC normalized) space.
+        mesh = trimesh.load(str(candidates[-1]), force="mesh")
+        print(f"       lwmr: {len(mesh.vertices)} verts, {len(mesh.faces)} faces "
+              f"({vertices_size} target vertices)")
+        return mesh
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def _points_to_mesh(surface_pts: np.ndarray, poisson_depth: int = 10) -> "trimesh.Trimesh":
     """Convert surface point cloud to mesh via Poisson reconstruction (open3d).
 
@@ -880,11 +1103,27 @@ def main():
     parser.add_argument("--poisson-depth", default=10, type=int,
                         help="Poisson reconstruction octree depth (default: 10; 9=coarse, 11=fine)")
     parser.add_argument("--mesh-method", default="poisson",
-                        choices=["poisson", "noksr", "both"],
+                        choices=["poisson", "noksr", "sap", "lwmr", "both"],
                         help="Mesh reconstruction method: poisson (Open3D Poisson, default), "
                              "noksr (nksr Neural Kernel Surface Reconstruction), "
-                             "both (run both and save {name}_poisson.obj + {name}_noksr.obj "
-                             "for quality comparison; {name}.obj uses noksr)")
+                             "sap (Shape As Points / DPSR spectral Poisson — fast, no checkpoint), "
+                             "lwmr (LightweightMR CVPR 2025 — curvature-adaptive low-poly mesh, "
+                             "per-object optimization ~10-30 min), "
+                             "both (poisson + noksr comparison; {name}.obj uses noksr)")
+    parser.add_argument("--sap-grid-res", default=256, type=int,
+                        help="SAP/DPSR grid resolution per axis (default: 256; "
+                             "128=fast/coarse, 512=fine/more VRAM)")
+    parser.add_argument("--sap-sigma", default=2.0, type=float,
+                        help="SAP/DPSR Gaussian smoothing sigma (default: 2.0; "
+                             "higher=smoother surface)")
+    parser.add_argument("--lwmr-sdf-iters", default=20_000, type=int,
+                        help="LightweightMR SDF-fitting iterations (default: 20000, "
+                             "paper setting; lower=faster but less accurate SDF)")
+    parser.add_argument("--lwmr-vg-iters", default=8_000, type=int,
+                        help="LightweightMR vertex-generation iterations (default: 8000)")
+    parser.add_argument("--lwmr-vertices", default=3_400, type=int,
+                        help="LightweightMR output vertex count (default: 3400 — "
+                             "low-poly mesh, no decimation needed)")
     parser.add_argument("--no-floor-cap", action="store_true",
                         help="Disable the automatic floor cap. By default, when a mask is "
                              "provided the mesh is cut at the support plane (1st pct of "
@@ -1025,43 +1264,55 @@ def main():
     _save_ply(numcc_ply, to_y_up(surface_pts))
     print(f"      PLY saved: {numcc_ply}  (Y-up)")
 
-    use_noksr  = args.mesh_method in ("noksr", "both")
-    use_poisson = args.mesh_method in ("poisson", "both")
+    # ── mesh reconstruction — dispatch by method ──────────────────────────────
+    meshers = {
+        "poisson": lambda pts: _points_to_mesh(pts, poisson_depth=args.poisson_depth),
+        "noksr":   _points_to_mesh_noksr,
+        "sap":     lambda pts: _points_to_mesh_sap(
+                       pts, grid_res=args.sap_grid_res, sigma=args.sap_sigma),
+        "lwmr":    lambda pts: _points_to_mesh_lwmr(
+                       pts, args.name, sdf_iters=args.lwmr_sdf_iters,
+                       vg_iters=args.lwmr_vg_iters,
+                       vertices_size=args.lwmr_vertices),
+    }
+    selected = ["poisson", "noksr"] if args.mesh_method == "both" else [args.mesh_method]
+    # Primary mesh: noksr for "both" (back-compat), else the chosen method
+    primary = "noksr" if args.mesh_method == "both" else args.mesh_method
 
-    raw_mesh_poisson = None
-    raw_mesh_noksr   = None
-
-    if use_poisson:
-        print("[4b/6] Meshing surface points (Poisson reconstruction)...")
-        raw_mesh_poisson = _points_to_mesh(surface_pts, poisson_depth=args.poisson_depth)
-        print(f"       Poisson raw mesh: {len(raw_mesh_poisson.faces)} faces")
-
-    if use_noksr:
-        print("[4b/6] Meshing surface points (nksr — Neural Kernel Surface Reconstruction)...")
-        raw_mesh_noksr = _points_to_mesh_noksr(surface_pts)
-        print(f"       nksr raw mesh: {len(raw_mesh_noksr.faces)} faces")
+    raw_meshes: dict = {}
+    for label in selected:
+        print(f"[4b/6] Meshing surface points ({label})...")
+        try:
+            raw_meshes[label] = meshers[label](surface_pts)
+            print(f"       {label} raw mesh: {len(raw_meshes[label].faces)} faces")
+        except Exception as e:
+            print(f"       {label} failed ({e})"
+                  + (" — falling back to poisson" if label != "poisson" else ""))
+            if label != "poisson":
+                raw_meshes["poisson"] = meshers["poisson"](surface_pts)
+                if label == primary:
+                    primary = "poisson"
+                print(f"       poisson fallback mesh: "
+                      f"{len(raw_meshes['poisson'].faces)} faces")
+            else:
+                raise
+    selected = [l for l in selected if l in raw_meshes] or list(raw_meshes)
 
     # ── silhouette clip first: remove lateral excess before adding floor cap ───
     # Must run BEFORE floor cap so the cap vertices (which project below the mask
     # footprint) are not clipped away.
     if seen_mask is not None:
         print("[4c/6] Clipping lateral excess via SAM2 mask silhouette...")
-        if raw_mesh_poisson is not None:
-            raw_mesh_poisson = _clip_by_mask_silhouette(
-                raw_mesh_poisson, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
-                dilation_px=0)
-        if raw_mesh_noksr is not None:
-            raw_mesh_noksr = _clip_by_mask_silhouette(
-                raw_mesh_noksr, norm_center, norm_scale, fx, fy, cx, cy, seen_mask,
-                dilation_px=0)
+        for label in raw_meshes:
+            raw_meshes[label] = _clip_by_mask_silhouette(
+                raw_meshes[label], norm_center, norm_scale, fx, fy, cx, cy,
+                seen_mask, dilation_px=0)
 
     # ── floor cap: cut at support plane + add contour-following cap ──────────
     if z_floor_norm is not None:
         print("[4d/6] Applying floor cap (slice at support plane + contour cap)...")
-        if raw_mesh_poisson is not None:
-            raw_mesh_poisson = _slice_and_cap_at_floor(raw_mesh_poisson, z_floor_norm)
-        if raw_mesh_noksr is not None:
-            raw_mesh_noksr = _slice_and_cap_at_floor(raw_mesh_noksr, z_floor_norm)
+        for label in raw_meshes:
+            raw_meshes[label] = _slice_and_cap_at_floor(raw_meshes[label], z_floor_norm)
 
     # ── convert finished mesh(es) to Y-up frame ──────────────────────────────
     # Everything above (NU-MCC, silhouette clip, floor cap) runs in the OpenCV
@@ -1070,26 +1321,21 @@ def main():
     print("[4e/6] Converting mesh(es) to Y-up frame (180° about X)...")
     T_yup = np.eye(4)
     T_yup[:3, :3] = CAM_TO_YUP
-    if raw_mesh_poisson is not None:
-        raw_mesh_poisson.apply_transform(T_yup)
-    if raw_mesh_noksr is not None:
-        raw_mesh_noksr.apply_transform(T_yup)
+    for label in raw_meshes:
+        raw_meshes[label].apply_transform(T_yup)
 
-    # Primary mesh: noksr when available, else poisson
-    raw_mesh = raw_mesh_noksr if raw_mesh_noksr is not None else raw_mesh_poisson
+    raw_mesh = raw_meshes[primary]
 
     print("[5/6] Normalizing mesh(es) (longest axis -> 20 cm)...")
     mesh = normalize_mesh(raw_mesh)
     obj_path = asset_dir / f"{args.name}.obj"
     mesh.export(str(obj_path))
-    method_label = "noksr" if raw_mesh_noksr is not None else "poisson"
+    method_label = primary
     print(f"      Saved: {obj_path}  ({len(mesh.faces)} faces)  [{method_label}]")
 
-    if args.mesh_method == "both":
+    if len(raw_meshes) > 1:
         # Save individual comparison files before normalization scaling is lost
-        for label, rm in [("poisson", raw_mesh_poisson), ("noksr", raw_mesh_noksr)]:
-            if rm is None:
-                continue
+        for label, rm in raw_meshes.items():
             m_norm = normalize_mesh(rm)
             cmp_path = asset_dir / f"{args.name}_{label}.obj"
             m_norm.export(str(cmp_path))
@@ -1116,9 +1362,9 @@ def main():
 
     print(f"\nDone -> {asset_dir}/  ({time.time() - t_start:.1f}s total)")
     print(f"  {args.name}.obj  [{method_label}]")
-    if args.mesh_method == "both":
-        print(f"  {args.name}_poisson.obj")
-        print(f"  {args.name}_noksr.obj")
+    if len(raw_meshes) > 1:
+        for label in raw_meshes:
+            print(f"  {args.name}_{label}.obj")
     print(f"  {args.name}.sdf")
     print(f"  {args.name}_numcc_surface.ply  ← raw NU-MCC output (normalized space)")
     print(f"  {args.name}_object_cloud.ply   ← depth back-projection (metric space)")
