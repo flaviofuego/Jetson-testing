@@ -18,7 +18,10 @@ import time
 from pathlib import Path
 import numpy as np
 
-from pointcloud_utils import load_depth, depth_to_pointcloud, subsample_pointcloud, load_intrinsics
+from pointcloud_utils import (
+    load_depth, depth_to_pointcloud, subsample_pointcloud, load_intrinsics,
+    to_y_up, CAM_TO_YUP,
+)
 from mesh_utils import normalize_mesh, decompose_convex
 from sdf_generator import generate_sdf
 
@@ -844,10 +847,12 @@ def main():
     cu = (u_obj * (color_W / depth_W)).astype(int).clip(0, color_W - 1)
     object_colors = color[cv, cu, :3].astype(np.uint8)  # (N, 3)
 
-    # Save PLY of the SAM2-filtered object point cloud (all points, before subsampling)
+    # Save PLY of the SAM2-filtered object point cloud (all points, before subsampling).
+    # Persisted in the Y-up frame for viewers/Drake; object_pts stays camera-frame
+    # for the floor-cap percentile and query-grid bbox computed below.
     ply_path = asset_dir / f"{args.name}_object_cloud.ply"
-    _save_ply(ply_path, object_pts, object_colors)
-    print(f"      PLY saved: {ply_path}  ({len(object_pts)} pts, RGB)")
+    _save_ply(ply_path, to_y_up(object_pts), object_colors)
+    print(f"      PLY saved: {ply_path}  ({len(object_pts)} pts, RGB, Y-up)")
 
     partial_pts = subsample_pointcloud(object_pts, n=args.n_input)
     print(f"      object cloud: {len(object_pts)} pts -> {len(partial_pts)} subsampled  "
@@ -869,7 +874,7 @@ def main():
         # Always use camera-frame partial_pts for the query grid bounding box.
         query_pts = partial_pts
         completed_pts_path = asset_dir / f"{args.name}_pointcloud.npy"
-        np.save(str(completed_pts_path), completed_pts)
+        np.save(str(completed_pts_path), to_y_up(completed_pts))
         print(f"      Saved P2C output: {completed_pts_path}")
 
     # ── [4] NU-MCC ────────────────────────────────────────────────────────────
@@ -914,10 +919,12 @@ def main():
         z_floor_norm = (z_floor - float(norm_center[2])) / norm_scale
     print(f"      {len(surface_pts)} surface points")
 
-    # Save PLY of raw NU-MCC surface output (normalized space, before meshing)
+    # Save PLY of raw NU-MCC surface output (normalized space, before meshing).
+    # Persisted Y-up; surface_pts stays camera-frame for the in-process meshing,
+    # silhouette clip and floor cap (all of which depend on the camera convention).
     numcc_ply = asset_dir / f"{args.name}_numcc_surface.ply"
-    _save_ply(numcc_ply, surface_pts)
-    print(f"      PLY saved: {numcc_ply}")
+    _save_ply(numcc_ply, to_y_up(surface_pts))
+    print(f"      PLY saved: {numcc_ply}  (Y-up)")
 
     use_noksr  = args.mesh_method in ("noksr", "both")
     use_poisson = args.mesh_method in ("poisson", "both")
@@ -956,6 +963,18 @@ def main():
             raw_mesh_poisson = _slice_and_cap_at_floor(raw_mesh_poisson, z_floor_norm)
         if raw_mesh_noksr is not None:
             raw_mesh_noksr = _slice_and_cap_at_floor(raw_mesh_noksr, z_floor_norm)
+
+    # ── convert finished mesh(es) to Y-up frame ──────────────────────────────
+    # Everything above (NU-MCC, silhouette clip, floor cap) runs in the OpenCV
+    # camera frame (Y-down, Z-forward). Rotate the completed mesh 180° about X so
+    # the persisted OBJ/SDF (and the comparison exports) are Y-up like the clouds.
+    print("[4e/6] Converting mesh(es) to Y-up frame (180° about X)...")
+    T_yup = np.eye(4)
+    T_yup[:3, :3] = CAM_TO_YUP
+    if raw_mesh_poisson is not None:
+        raw_mesh_poisson.apply_transform(T_yup)
+    if raw_mesh_noksr is not None:
+        raw_mesh_noksr.apply_transform(T_yup)
 
     # Primary mesh: noksr when available, else poisson
     raw_mesh = raw_mesh_noksr if raw_mesh_noksr is not None else raw_mesh_poisson

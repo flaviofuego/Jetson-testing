@@ -26,6 +26,26 @@ def depth_to_pointcloud(depth: np.ndarray, fx: float, fy: float,
     return np.stack([X, Y, Z], axis=1).astype(np.float32)
 
 
+# Coordinate convention: depth_to_pointcloud() emits points in the OpenCV camera
+# frame (+X right, +Y down, +Z forward/into scene). Viewers and Drake expect a
+# Y-up frame. Convert with a 180° rotation about the X axis: it flips Y (down→up)
+# and Z (forward→back), fixing the XZ-plane orientation, while keeping det=+1 so
+# handedness is preserved (no mirroring). This is the standard OpenCV→OpenGL
+# camera-frame conversion, applied as a post-processing step on the reconstruction
+# (NOT inside the depth estimator).
+CAM_TO_YUP = np.array([
+    [1.0,  0.0,  0.0],
+    [0.0, -1.0,  0.0],
+    [0.0,  0.0, -1.0],
+], dtype=np.float32)
+
+
+def to_y_up(pts: np.ndarray) -> np.ndarray:
+    """Rotate (N, 3) points from the OpenCV camera frame (Y-down, Z-forward) to a
+    Y-up frame: (x, y, z) → (x, -y, -z). Returns a new (N, 3) float32 array."""
+    return (np.asarray(pts, dtype=np.float32) @ CAM_TO_YUP.T).astype(np.float32)
+
+
 def subsample_pointcloud(pts: np.ndarray, n: int) -> np.ndarray:
     """Random subsample to n points; repeat-pad if fewer than n available."""
     if len(pts) >= n:
