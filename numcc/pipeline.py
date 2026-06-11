@@ -107,8 +107,12 @@ def run_numcc(
     n_query: int = 200_000,
     batch_size: int = 40_000,
     n_iter: int = 3,
-) -> np.ndarray:
-    """Reconstruct surface point cloud with NU-MCC. Returns (N, 3) float32 numpy array.
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Reconstruct surface point cloud with NU-MCC.
+
+    Returns (surface_pts, norm_center, norm_scale) where surface_pts is (N, 3) float32
+    in normalized space, and norm_center/norm_scale are the normalization params used
+    (needed by the caller to convert metric floor depths to normalized space).
 
     NU-MCC expects:
       seen_images:    (B, 3, 800, 800) — RGB image (preprocess_img downscales to 224)
@@ -310,8 +314,115 @@ def run_numcc(
                           numcc_args, n_iter=numcc_args.udf_n_iter)
         refined.append(pts.detach().squeeze(0).cpu().numpy().astype(np.float32))
 
-    # Surface points are in normalized space; normalize_mesh handles rescaling.
-    return np.concatenate(refined, axis=0)
+    surface_pts = np.concatenate(refined, axis=0)
+    return surface_pts, norm_center, norm_scale
+
+
+def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "trimesh.Trimesh":
+    """Cut the mesh at the floor plane and add a shape-following cap.
+
+    Uses trimesh.intersections.slice_mesh_plane with cap=True, which computes the
+    cross-section of the mesh at z=z_floor_norm and closes it with a Delaunay-
+    triangulated polygon that follows the object's contour — NOT a flat rectangular
+    plane, but the actual silhouette shape of the object at that height.
+    """
+    import trimesh
+
+    # Camera looks down: small Z = top of object (near camera), large Z = bin (far).
+    # We want to KEEP the near side (z < z_floor_norm) and cap the cut at the bin level.
+    plane_normal = np.array([0.0, 0.0, -1.0])  # keep vertices with z < z_floor_norm
+    plane_origin = np.array([0.0, 0.0, z_floor_norm])
+    try:
+        # Step 1: slice without cap
+        mesh_cut = trimesh.intersections.slice_mesh_plane(
+            mesh, plane_normal, plane_origin, cap=False
+        )
+        n_removed = len(mesh.faces) - len(mesh_cut.faces)
+
+        # Step 2: find boundary edges (edges that appear only once = open boundary)
+        edges_sorted = np.sort(mesh_cut.edges, axis=1)
+        unique_edges, counts = np.unique(edges_sorted, axis=0, return_counts=True)
+        boundary = unique_edges[counts == 1]        # (N, 2) vertex index pairs
+        if len(boundary) == 0:
+            print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
+                  f"removed {n_removed} faces  no boundary — mesh already closed")
+            return mesh_cut
+
+        # Collect unique boundary vertex indices
+        boundary_verts_idx = np.unique(boundary)
+        boundary_verts = mesh_cut.vertices[boundary_verts_idx]
+
+        # Project them all to exactly z_floor_norm so the cap is planar
+        boundary_verts_projected = boundary_verts.copy()
+        boundary_verts_projected[:, 2] = z_floor_norm
+
+        # Add center vertex at centroid of boundary
+        centroid = boundary_verts_projected.mean(axis=0)
+        new_verts = np.vstack([mesh_cut.vertices,
+                               boundary_verts_projected,
+                               centroid.reshape(1, 3)])
+        n_orig = len(mesh_cut.vertices)
+        n_bnd  = len(boundary_verts_idx)
+        center_idx = n_orig + n_bnd  # index of centroid in new_verts
+
+        # Map original boundary vertex indices → new projected vertex indices
+        old_to_new = {int(old): n_orig + i for i, old in enumerate(boundary_verts_idx)}
+
+        # Build ordered boundary loop(s) by chaining edges
+        edge_map = {}
+        for a, b in boundary:
+            edge_map.setdefault(int(a), []).append(int(b))
+
+        visited = set()
+        cap_faces = []
+        for start in boundary_verts_idx:
+            start = int(start)
+            if start in visited:
+                continue
+            # Walk the loop
+            loop = [start]
+            visited.add(start)
+            cur = start
+            while True:
+                nexts = [v for v in edge_map.get(cur, []) if v not in visited]
+                if not nexts:
+                    break
+                nxt = nexts[0]
+                visited.add(nxt)
+                loop.append(nxt)
+                cur = nxt
+
+            # Fan triangulate: center → loop[i] → loop[i+1]
+            # Normal should point in +Z (toward bin), so wind counter-clockwise
+            # when viewed from +Z direction.
+            for i in range(len(loop) - 1):
+                a = old_to_new[loop[i]]
+                b = old_to_new[loop[i + 1]]
+                c = center_idx
+                # Ensure outward normal (+Z): cross(B-A, C-A).z > 0
+                va = new_verts[a]
+                vb = new_verts[b]
+                vc = new_verts[c]
+                normal_z = (vb[0]-va[0])*(vc[1]-va[1]) - (vb[1]-va[1])*(vc[0]-va[0])
+                if normal_z > 0:
+                    cap_faces.append([a, b, c])
+                else:
+                    cap_faces.append([a, c, b])
+
+        if cap_faces:
+            all_faces = np.vstack([mesh_cut.faces, np.array(cap_faces)])
+            mesh_final = trimesh.Trimesh(vertices=new_verts,
+                                         faces=all_faces, process=False)
+        else:
+            mesh_final = mesh_cut
+
+        print(f"      floor cap: cut at Z_norm={z_floor_norm:.3f}  "
+              f"removed {n_removed} faces  cap +{len(cap_faces)} faces  "
+              f"watertight={mesh_final.is_watertight}")
+        return mesh_final
+    except Exception as e:
+        print(f"      floor cap: failed ({e}) — returning original mesh")
+        return mesh
 
 
 def _points_to_mesh_noksr(surface_pts: np.ndarray) -> "trimesh.Trimesh":
@@ -526,6 +637,10 @@ def main():
                              "noksr (nksr Neural Kernel Surface Reconstruction), "
                              "both (run both and save {name}_poisson.obj + {name}_noksr.obj "
                              "for quality comparison; {name}.obj uses noksr)")
+    parser.add_argument("--no-floor-cap", action="store_true",
+                        help="Disable the automatic floor cap. By default, when a mask is "
+                             "provided the mesh is cut at the support plane (1st pct of "
+                             "object Z) and capped with a contour-following Delaunay face.")
     args = parser.parse_args()
 
     if args.intrinsics is None and any(v is None for v in [args.fx, args.fy, args.cx, args.cy]):
@@ -616,18 +731,35 @@ def main():
             m_img = PILImage.fromarray(seen_mask * 255).resize((W_d, H_d), PILImage.NEAREST)
             seen_mask = (np.asarray(m_img) > 0).astype(np.uint8)
 
+    # Floor cap: the bin surface is at the MAX depth (camera overhead → large Z = far = bin).
+    # Use 95th percentile of object Z: cuts slightly inside the mesh (not at the very
+    # edge) so slice_mesh_plane finds a proper interior cross-section to cap.
+    # 99th pct is right at the Poisson boundary where faces are degenerate.
+    z_floor = None
+    if args.mask is not None and not args.no_floor_cap:
+        z_floor = float(np.percentile(object_pts[:, 2], 95))
+        print(f"      floor cap: will cut at z_floor={z_floor:.4f} m  "
+              f"(95th pct of {len(object_pts)} object pts = bin surface)")
+
     print("[4/6] NU-MCC: reconstructing surface from RGB + depth XYZ map...")
     print(f"      seen_xyz source: full depth ({depth.shape}), {int((depth>0).sum())} valid px")
     print(f"      seen_mask: {'yes (object pixels only)' if seen_mask is not None else 'no (full scene)'}")
     print(f"      query grid anchor: {len(query_pts)} object pts (camera frame)")
-    surface_pts = run_numcc(color, depth, fx, fy, cx, cy,
-                            weights_dir=models_root / "numcc",
-                            query_pts=query_pts,
-                            seen_mask=seen_mask,
-                            udf_threshold=args.udf_threshold,
-                            n_query=args.n_query,
-                            batch_size=6_000,
-                            n_iter=args.udf_n_iter)
+    surface_pts, norm_center, norm_scale = run_numcc(
+        color, depth, fx, fy, cx, cy,
+        weights_dir=models_root / "numcc",
+        query_pts=query_pts,
+        seen_mask=seen_mask,
+        udf_threshold=args.udf_threshold,
+        n_query=args.n_query,
+        batch_size=6_000,
+        n_iter=args.udf_n_iter,
+    )
+
+    # Convert floor depth to normalized space (same coord system as surface_pts)
+    z_floor_norm = None
+    if z_floor is not None and norm_scale > 1e-6:
+        z_floor_norm = (z_floor - float(norm_center[2])) / norm_scale
     print(f"      {len(surface_pts)} surface points")
 
     # Save PLY of raw NU-MCC surface output (normalized space, before meshing)
@@ -650,6 +782,14 @@ def main():
         print("[4b/6] Meshing surface points (nksr — Neural Kernel Surface Reconstruction)...")
         raw_mesh_noksr = _points_to_mesh_noksr(surface_pts)
         print(f"       nksr raw mesh: {len(raw_mesh_noksr.faces)} faces")
+
+    # ── floor cap: cut at support plane + add contour-following cap ──────────
+    if z_floor_norm is not None:
+        print("[4c/6] Applying floor cap (slice at support plane + contour cap)...")
+        if raw_mesh_poisson is not None:
+            raw_mesh_poisson = _slice_and_cap_at_floor(raw_mesh_poisson, z_floor_norm)
+        if raw_mesh_noksr is not None:
+            raw_mesh_noksr = _slice_and_cap_at_floor(raw_mesh_noksr, z_floor_norm)
 
     # Primary mesh: noksr when available, else poisson
     raw_mesh = raw_mesh_noksr if raw_mesh_noksr is not None else raw_mesh_poisson
