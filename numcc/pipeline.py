@@ -96,6 +96,24 @@ def run_p2c(partial_pts: np.ndarray, weights_dir: Path) -> np.ndarray:
     return completed.squeeze(0).cpu().numpy().astype(np.float32)  # (M, 3)
 
 
+def _pad_to_square(arr: np.ndarray, value: float) -> np.ndarray:
+    """Pad an (H, W, C) array to a square (side = max(H, W)) by extending the
+    bottom or right edge with `value`.
+
+    Matches pad_image() in demo_iphone.py: a one-sided pad (not centered), so the
+    object stays anchored at the top-left exactly like the reference before the
+    final resize to the encoder resolution.
+    """
+    h, w = arr.shape[:2]
+    if h == w:
+        return arr
+    if h > w:
+        pad = np.full((h, h - w, arr.shape[2]), value, dtype=arr.dtype)
+        return np.concatenate([arr, pad], axis=1)
+    pad = np.full((w - h, w, arr.shape[2]), value, dtype=arr.dtype)
+    return np.concatenate([arr, pad], axis=0)
+
+
 def run_numcc(
     color: np.ndarray,
     depth: np.ndarray,
@@ -106,7 +124,7 @@ def run_numcc(
     udf_threshold: float = 0.23,
     n_query: int = 200_000,
     batch_size: int = 40_000,
-    n_iter: int = 3,
+    n_iter: int = 10,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Reconstruct surface point cloud with NU-MCC.
 
@@ -161,84 +179,107 @@ def run_numcc(
     model.load_state_dict(state)
     model.eval().cuda()
 
-    # ── seen_images: (1, 3, 800, 800) ────────────────────────────────────────
-    # Drop alpha channel if RGBA — model expects exactly 3 channels.
-    color_rgb = color[:, :, :3]
-    if color_rgb.dtype == np.uint8:
-        color_f = color_rgb.astype(np.float32) / 255.0
-    else:
-        color_f = color_rgb.astype(np.float32).clip(0.0, 1.0)
-    seen_images = torch.from_numpy(color_f.transpose(2, 0, 1)).float().unsqueeze(0).cuda()
-    # preprocess_img (called later) asserts input is 800×800 before downscaling to 224.
-    if seen_images.shape[2] != 800 or seen_images.shape[3] != 800:
-        seen_images = F.interpolate(seen_images, size=(800, 800), mode="bilinear", align_corners=False)
-
-    # ── xyz_map at 112×112: back-project downsampled depth ───────────────────
+    # ── back-project FULL-resolution depth → per-pixel metric XYZ map ─────────
+    # Build the XYZ map at full resolution FIRST. This is what lets the later crop
+    # zoom into the object and still fill the 112×112 grid — downsampling the whole
+    # frame to 112 up front (the previous approach) left only a tiny patch of valid
+    # object pixels in a corner, which is out-of-distribution for NU-MCC.
     H_orig, W_orig = depth.shape
-    depth_t = torch.from_numpy(depth).float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-    # Nearest-neighbour preserves valid/invalid pixel boundaries exactly.
-    depth_small = F.interpolate(depth_t, size=(XYZ_SIZE, XYZ_SIZE), mode="nearest")
-    depth_small = depth_small.squeeze().numpy()  # (112, 112)
+    v_idx, u_idx = np.mgrid[0:H_orig, 0:W_orig]
+    Zf = depth.astype(np.float32)
+    Xf = (u_idx - cx) * Zf / fx
+    Yf = (v_idx - cy) * Zf / fy
+    xyz_full = np.stack([Xf, Yf, Zf], axis=-1).astype(np.float32)  # (H, W, 3)
+    xyz_full[Zf == 0] = np.nan  # no depth → invalid
 
-    # Scale intrinsics proportionally to the new resolution.
-    scale_x = XYZ_SIZE / W_orig
-    scale_y = XYZ_SIZE / H_orig
-    fx_s, fy_s = fx * scale_x, fy * scale_y
-    cx_s, cy_s = cx * scale_x, cy * scale_y
-
-    v_idx, u_idx = np.mgrid[0:XYZ_SIZE, 0:XYZ_SIZE]
-    Z = depth_small
-    X = (u_idx - cx_s) * Z / fx_s
-    Y = (v_idx - cy_s) * Z / fy_s
-    xyz_map = np.stack([X, Y, Z], axis=-1).astype(np.float32)  # (112, 112, 3)
-    xyz_map[Z == 0] = np.nan  # no depth → invalid
-
-    # ── apply SAM2 mask at numpy level (before normalization) ────────────────
-    # The demo (demo_iphone.py) masks *before* normalize(), so stats are computed
-    # from object pixels only — not the background scene.
+    # ── restrict to object pixels (SAM2 mask) at full resolution ─────────────
+    # demo_iphone.py masks *before* normalize(), so stats come from object pixels.
     if seen_mask is not None:
-        from PIL import Image as PILImage
-        m_img = PILImage.fromarray(seen_mask.astype(np.uint8) * 255).resize(
-            (XYZ_SIZE, XYZ_SIZE), PILImage.NEAREST
-        )
-        mask_small_np = np.asarray(m_img) > 0  # (112, 112) bool
-        xyz_map[~mask_small_np] = np.nan  # background pixels → invalid
+        mask_full = seen_mask.astype(bool)
+        if mask_full.shape != (H_orig, W_orig):
+            from PIL import Image as PILImage
+            m_img = PILImage.fromarray(mask_full.astype(np.uint8) * 255).resize(
+                (W_orig, H_orig), PILImage.NEAREST
+            )
+            mask_full = np.asarray(m_img) > 0
+        xyz_full[~mask_full] = np.nan  # background pixels → invalid
 
-    # ── normalize seen_xyz — matches demo_iphone.py normalize() ─────────────
-    # CO3D-V2 training uses point clouds normalized to zero-mean, unit std.
-    # Without this the XYZPosEmbed linear layer receives out-of-distribution
-    # metric-scale coords (e.g. Z≈0.5 m) and produces garbage UDF predictions.
-    valid_mask = np.isfinite(xyz_map).all(-1)   # (112, 112)
-    valid_pts  = xyz_map[valid_mask]             # (K, 3)
+    # ── normalize seen_xyz — matches demo_iphone.py normalize() ──────────────
+    # CO3D-V2 training uses point clouds normalized to zero-mean, unit-std (single
+    # scalar scale = mean of per-axis std). Without this the XYZPosEmbed linear
+    # layer receives out-of-distribution metric coords and produces garbage UDF.
+    valid_full  = np.isfinite(xyz_full).all(-1)   # (H, W)
+    valid_pts   = xyz_full[valid_full]            # (K, 3)
     norm_center = np.zeros(3, dtype=np.float32)
     norm_scale  = 1.0
     if len(valid_pts) >= 3:
-        per_axis_std = (valid_pts.var(axis=0) ** 0.5)   # (3,) — std per axis
-        _scale = float(per_axis_std.mean())
+        _scale = float((valid_pts.var(axis=0) ** 0.5).mean())
         if _scale > 1e-6:
             norm_center = valid_pts.mean(axis=0)         # (3,)
             norm_scale  = _scale
-            xyz_map[valid_mask] = (xyz_map[valid_mask] - norm_center) / norm_scale
+            xyz_full[valid_full] = (xyz_full[valid_full] - norm_center) / norm_scale
             print(f"      normalize: center={norm_center.round(3)}  scale={norm_scale:.4f}")
         else:
             print("      WARNING: near-zero variance in seen_xyz — normalization skipped")
     else:
         print(f"      WARNING: only {len(valid_pts)} valid xyz pixels — normalization skipped")
 
+    # ── crop to object bbox (+margin), pad to square, resize → 112 ───────────
+    # This is the key step from demo_iphone.py main_demo(): the object is cropped
+    # and zoomed so it FILLS the 112×112 encoder grid instead of occupying a tiny
+    # patch of the full frame. Both seen_xyz and seen_images use the SAME bbox so
+    # the image and geometry stay spatially aligned for the encoder fusion.
+    ys, xs = np.where(valid_full)
+    if len(ys) == 0:
+        raise RuntimeError("No valid object pixels for seen_xyz — check mask/depth alignment.")
+    MARGIN = 40  # pixels, matches demo_iphone.py
+    top    = max(int(ys.min()) - MARGIN, 0)
+    bottom = min(int(ys.max()) + MARGIN, H_orig - 1)
+    left   = max(int(xs.min()) - MARGIN, 0)
+    right  = min(int(xs.max()) + MARGIN, W_orig - 1)
+    xyz_crop = xyz_full[top:bottom + 1, left:right + 1]   # (h, w, 3)
+    print(f"      object bbox: rows[{top}:{bottom}] cols[{left}:{right}]  "
+          f"crop={xyz_crop.shape[0]}×{xyz_crop.shape[1]} of {H_orig}×{W_orig}")
+
+    xyz_sq = _pad_to_square(xyz_crop, np.nan)             # square, nan-padded
+    # Nearest keeps valid/invalid boundaries crisp (no nan bleeding into neighbours).
+    xyz_map = F.interpolate(
+        torch.from_numpy(xyz_sq).permute(2, 0, 1).unsqueeze(0),
+        size=(XYZ_SIZE, XYZ_SIZE), mode="nearest",
+    ).squeeze(0).permute(1, 2, 0).numpy()                 # (112, 112, 3)
+
+    # ── seen_images: crop the SAME bbox (in color resolution), pad, resize → 800 ─
+    # Drop alpha channel if RGBA — model expects exactly 3 channels.
+    color_rgb = color[:, :, :3]
+    if color_rgb.dtype == np.uint8:
+        color_f = color_rgb.astype(np.float32) / 255.0
+    else:
+        color_f = color_rgb.astype(np.float32).clip(0.0, 1.0)
+    cH, cW = color_f.shape[:2]
+    sy, sx = cH / H_orig, cW / W_orig
+    ct = max(int(round(top * sy)), 0)
+    cb = min(int(round((bottom + 1) * sy)), cH)
+    cl = max(int(round(left * sx)), 0)
+    cr = min(int(round((right + 1) * sx)), cW)
+    color_sq = _pad_to_square(color_f[ct:cb, cl:cr], 0.0)  # black pad (matches reference)
+    seen_images = torch.from_numpy(color_sq.transpose(2, 0, 1)).float().unsqueeze(0).cuda()
+    # preprocess_img (called later) asserts input is 800×800 before downscaling to 224.
+    seen_images = F.interpolate(seen_images, size=(800, 800), mode="bilinear", align_corners=False)
+
     # Apply the same linear transform to query_pts so both are in the same space.
     if query_pts is None:
-        query_pts = xyz_map[valid_mask]  # already normalized
+        query_pts = xyz_full[valid_full]  # already normalized
     else:
         query_pts = (query_pts - norm_center) / norm_scale
 
     # ── convert to tensor ─────────────────────────────────────────────────────
-    seen_xyz_t = torch.from_numpy(xyz_map).unsqueeze(0).cuda()  # (1, 112, 112, 3)
+    seen_xyz_t = torch.from_numpy(np.ascontiguousarray(xyz_map)).unsqueeze(0).cuda()  # (1,112,112,3)
     valid_seen = torch.isfinite(seen_xyz_t.sum(-1))              # (1, 112, 112)
     # float('inf') as sentinel for invalid: shrink_points_beyond_threshold skips
     # non-finite values, and XYZPosEmbed overwrites them with invalid_xyz_token.
     seen_xyz_t[~valid_seen] = float('inf')
     print(f"      seen_xyz valid: {valid_seen.sum().item()} / {XYZ_SIZE**2} px"
-          + (" (depth+mask)" if seen_mask is not None else " (depth only)"))
+          + (" (cropped+zoomed object)" if seen_mask is not None else " (full frame)"))
 
     # ── encode once ───────────────────────────────────────────────────────────
     with torch.no_grad():
@@ -300,9 +341,12 @@ def run_numcc(
         print(f"      UDF < {t:.2f}: {(all_udf < t).sum()} pts")
 
     if not candidate_batches:
-        # Fallback: return normalized seen_xyz points
+        # Fallback: no query point fell below the UDF threshold. Return the
+        # normalized seen_xyz points so the caller still gets a (pts, center, scale)
+        # tuple instead of crashing on tuple-unpacking.
         valid = np.isfinite(xyz_map).all(-1)
-        return xyz_map[valid]
+        print("      WARNING: no UDF candidates below threshold — returning seen_xyz cloud")
+        return xyz_map[valid], norm_center, norm_scale
 
     # ── pass 2: move_points — gradient descent to snap candidates to surface ──
     # Each point moves toward the zero-level set: x ← x - ∇UDF * UDF(x)
@@ -730,8 +774,10 @@ def main():
                         help="NU-MCC UDF threshold for surface extraction (default: 0.23, "
                              "matches CO3D-V2 training). Candidates below this distance are "
                              "then refined with move_points gradient descent.")
-    parser.add_argument("--udf-n-iter", default=3, type=int,
-                        help="move_points gradient-descent iterations (default: 3, more→better surface)")
+    parser.add_argument("--udf-n-iter", default=10, type=int,
+                        help="move_points gradient-descent iterations to snap candidates onto the "
+                             "zero-level set (default: 10, matches demo_iphone.py; more→better "
+                             "surface alignment)")
     parser.add_argument("--n-query", default=200_000, type=int,
                         help="Query grid points for UDF evaluation (default: 200000, "
                              "n_side=cbrt(n_query) per axis). More→denser surface coverage.")

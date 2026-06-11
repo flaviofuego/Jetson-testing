@@ -306,7 +306,7 @@ def stage_numcc(
     intrinsics_json: Path,
     name: str,
     monitor: VRAMMonitor,
-    udf_threshold: float = 0.05,
+    udf_threshold: float = 0.23,
 ) -> tuple[Path, float, float]:
     header("STAGE 4 — numcc  (NU-MCC, no P2C)")
 
@@ -449,8 +449,9 @@ def main():
     ap.add_argument("--skip-drake",      action="store_true", help="Skip Drake stage entirely")
     ap.add_argument("--drake-interactive", action="store_true",
                     help="Open Meshcat visualizer (blocks until Ctrl+C)")
-    ap.add_argument("--udf-threshold", type=float, default=0.05,
-                    help="NU-MCC UDF threshold for surface extraction (default: 0.05)")
+    ap.add_argument("--udf-threshold", type=float, default=0.23,
+                    help="NU-MCC UDF threshold for surface extraction (default: 0.23, "
+                         "matches CO3D-V2 training; lower values keep far fewer surface points)")
     args = ap.parse_args()
 
     image_path = args.image.resolve()
