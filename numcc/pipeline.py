@@ -117,6 +117,88 @@ def _pad_to_square(arr: np.ndarray, value: float) -> np.ndarray:
     return np.concatenate([arr, pad], axis=0)
 
 
+def _save_img(path: Path, arr: np.ndarray):
+    """Save an (H,W) or (H,W,3) array as PNG (min-max stretched if float)."""
+    from PIL import Image as PILImage
+    a = np.asarray(arr)
+    if a.dtype != np.uint8:
+        a = a.astype(np.float32)
+        lo, hi = float(np.nanmin(a)), float(np.nanmax(a))
+        a = np.where(np.isfinite(a), a, lo)
+        a = ((a - lo) / max(hi - lo, 1e-6) * 255).astype(np.uint8)
+    PILImage.fromarray(a).save(str(path))
+
+
+def _dump_numcc_io(
+    debug_dir: Path,
+    seen_images, seen_images_proc, seen_xyz_t, valid_seen,
+    norm_center, norm_scale, grid_min, grid_max,
+    all_udf, candidates, surface_pts, udf_threshold,
+    anchors=None,
+):
+    """Persist a 'serie de copias' of NU-MCC's actual inputs and outputs so the
+    reconstruction can be inspected for the taza (or any) input. Points are saved
+    BOTH in normalized space (what NU-MCC sees) and de-normalized metric Y-up space
+    (comparable to the depth cloud). Helps answer: is NU-MCC completing the object,
+    or only re-tracing the seen surface?"""
+    import json
+    debug_dir.mkdir(parents=True, exist_ok=True)
+
+    def to_metric_yup(pts_norm):
+        m = np.asarray(pts_norm, np.float32) * norm_scale + norm_center
+        return to_y_up(m)
+
+    # ── INPUTS ───────────────────────────────────────────────────────────────
+    si = seen_images[0].detach().cpu().numpy().transpose(1, 2, 0)         # 800×800×3
+    _save_img(debug_dir / "01_input_seen_image.png", np.clip(si, 0, 1))
+    sip = seen_images_proc[0].detach().cpu().numpy().transpose(1, 2, 0)   # 224×224×3 (norm)
+    _save_img(debug_dir / "02_input_seen_image_proc.png", sip)
+
+    vs = valid_seen[0].detach().cpu().numpy()                            # 112×112 bool
+    _save_img(debug_dir / "03_input_seen_xyz_valid.png", vs.astype(np.uint8) * 255)
+    sxyz = seen_xyz_t[0].detach().cpu().numpy()                          # 112×112×3
+    z = sxyz[:, :, 2].copy(); z[~np.isfinite(z)] = np.nan
+    _save_img(debug_dir / "04_input_seen_xyz_Z.png", z)
+
+    seen_pts_norm = sxyz[vs]                                              # (K,3) normalized
+    _save_ply(debug_dir / "05_input_seen_xyz.ply", to_metric_yup(seen_pts_norm))
+
+    # ── OUTPUTS ──────────────────────────────────────────────────────────────
+    if candidates is not None and len(candidates):
+        _save_ply(debug_dir / "06_output_candidates.ply", to_metric_yup(candidates))
+    _save_ply(debug_dir / "07_output_surface.ply", to_metric_yup(surface_pts))
+    np.save(debug_dir / "08_output_udf_values.npy", all_udf)
+    if anchors is not None:
+        # The 200 anchor centers NU-MCC predicts (its internal shape hypothesis).
+        _save_ply(debug_dir / "10_model_anchors.ply", to_metric_yup(anchors))
+
+    # ── completion metric: does the surface go BEHIND the seen shell? ─────────
+    seen_m = to_metric_yup(seen_pts_norm)
+    surf_m = to_metric_yup(surface_pts)
+    seen_zmin = float(seen_m[:, 2].min())
+    behind = int((surf_m[:, 2] < seen_zmin - 0.005).sum())
+
+    summary = {
+        "norm_center": [float(x) for x in np.asarray(norm_center).ravel()],
+        "norm_scale": float(norm_scale),
+        "udf_threshold": float(udf_threshold),
+        "seen_xyz_valid_px": int(vs.sum()),
+        "candidates": int(len(candidates)) if candidates is not None else 0,
+        "surface_pts": int(len(surface_pts)),
+        "udf_min": float(all_udf.min()), "udf_median": float(np.median(all_udf)),
+        "udf_max": float(all_udf.max()),
+        "grid_min": [float(x) for x in np.asarray(grid_min).ravel()],
+        "grid_max": [float(x) for x in np.asarray(grid_max).ravel()],
+        "seen_Z_metric_min": seen_zmin,
+        "surface_Z_metric_min": float(surf_m[:, 2].min()),
+        "surface_pts_behind_seen": behind,
+        "pct_completion": round(100.0 * behind / max(len(surf_m), 1), 2),
+    }
+    (debug_dir / "09_summary.json").write_text(json.dumps(summary, indent=2))
+    print(f"      [debug-dump] NU-MCC I/O → {debug_dir}  "
+          f"(completion={summary['pct_completion']}% behind seen shell)")
+
+
 def run_numcc(
     color: np.ndarray,
     depth: np.ndarray,
@@ -128,6 +210,7 @@ def run_numcc(
     n_query: int = 200_000,
     batch_size: int = 40_000,
     n_iter: int = 10,
+    debug_dir: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Reconstruct surface point cloud with NU-MCC.
 
@@ -362,6 +445,16 @@ def run_numcc(
         refined.append(pts.detach().squeeze(0).cpu().numpy().astype(np.float32))
 
     surface_pts = np.concatenate(refined, axis=0)
+
+    if debug_dir is not None:
+        cand_all = torch.cat([c for c in candidate_batches], dim=0).cpu().numpy()
+        _dump_numcc_io(
+            debug_dir, seen_images, seen_images_proc, seen_xyz_t, valid_seen,
+            norm_center, norm_scale, grid_min, grid_max,
+            all_udf, cand_all, surface_pts, udf_threshold,
+            anchors=centers_xyz[0].detach().cpu().numpy(),
+        )
+
     return surface_pts, norm_center, norm_scale
 
 
@@ -796,6 +889,11 @@ def main():
                         help="Disable the automatic floor cap. By default, when a mask is "
                              "provided the mesh is cut at the support plane (1st pct of "
                              "object Z) and capped with a contour-following Delaunay face.")
+    parser.add_argument("--debug-dump", default=None, type=Path,
+                        help="If set, write a 'serie de copias' of NU-MCC's inputs "
+                             "(seen image, seen_xyz map, valid mask, points) and outputs "
+                             "(candidates, surface, UDF values, completion summary) to this "
+                             "directory for inspection.")
     args = parser.parse_args()
 
     if args.intrinsics is None and any(v is None for v in [args.fx, args.fy, args.cx, args.cy]):
@@ -911,6 +1009,7 @@ def main():
         n_query=args.n_query,
         batch_size=6_000,
         n_iter=args.udf_n_iter,
+        debug_dir=args.debug_dump,
     )
 
     # Convert floor depth to normalized space (same coord system as surface_pts)
