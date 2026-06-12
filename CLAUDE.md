@@ -227,7 +227,7 @@ docker run --rm --gpus all \
 
 nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. Para Drake: `poisson`/`sap` si se necesitan menos partes CoACD; `lwmr` da la malla más liviana (ideal colisión) pero tarda. Si un método falla (deps faltantes), el pipeline cae a poisson con warning.
 
-**Rebuild requerido para sap/lwmr:** `sap` necesita PyMCubes y `lwmr` necesita el repo LightweightMR + binarios CGAL — ambos se instalan en `numcc/Dockerfile.x86` (secciones 6b/6c, best-effort). Los binarios Delaunay se compilan desde fuentes parcheadas en `numcc/lwmr_patches/` (reemplazan la dependencia Open3D C++ —prebuilt solo libc++, no enlaza con gcc/libstdc++— por un mini lector/escritor PLY `miniply.h`). Otros fixes horneados: kdtree.c regenerado con Cython moderno (Python ≥3.10), `-std=c++17` en hashencoder (torch 2.1), JIT CUDA precompilado en build. lwmr corre con `PYTHONPATH=` vacío (el paquete `models` de /opt/p2c colisiona). Rebuild: `docker build -t numcc:x86 -f numcc/Dockerfile.x86 numcc/`. Sin rebuild ambos métodos caen a poisson. Verificado end-to-end: esfera 20K pts → 648 faces en 190s (iters reducidos 1500/1000).
+**Rebuild requerido para sap/lwmr:** `sap` necesita PyMCubes y `lwmr` necesita el repo + binarios CGAL + Open3D C++ SDK — ambos se instalan en `numcc/Dockerfile.x86` (secciones 6b/6c, best-effort). Rebuild: `docker build -t numcc:x86 -f numcc/Dockerfile.x86 numcc/`. Sin rebuild ambos métodos caen a poisson.
 
 **Outputs en `assets/<nombre>/`:**
 - `<nombre>.obj` — mesh final (método elegido)
