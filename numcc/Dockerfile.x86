@@ -51,39 +51,6 @@ COPY nksr/package/ /opt/nksr/
 RUN pip install --no-cache-dir --no-build-isolation /opt/nksr/ || \
     echo "WARNING: nksr build failed — noksr method will use BPA fallback"
 
-# ── 6b. SAP/DPSR meshing dep — marching cubes ────────────────────────────────
-RUN pip install --no-cache-dir PyMCubes
-
-# ── 6c. LightweightMR (CVPR 2025) — curvature-adaptive low-poly meshing ──────
-# Per-object optimization mesher (--mesh-method lwmr). Needs:
-#   - CGAL + boost + gmp/mpfr for the Delaunay binaries
-#   - Open3D C++ SDK (prebuilt devel tarball) for create_delaunay
-#   - spconv/torch_scatter/flash-less PointTransformerV3 for the VG network
-# Every step is best-effort (|| echo): if any piece fails the image still
-# builds and pipeline.py falls back to poisson at runtime.
-RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    libcgal-dev libboost-dev libboost-thread-dev libgmp-dev libmpfr-dev wget xz-utils \
-    && rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 https://github.com/CharizardChenZhang/LightweightMR.git /opt/lwmr
-RUN pip install --no-cache-dir pyhocon fpsample addict cython spconv-cu118
-# kdtree Cython/C++ extension used for fast SDF queries
-RUN cd /opt/lwmr/models/cpplib && \
-    CC=gcc CXX=g++ python setup.py build_ext --inplace || \
-    echo "WARNING: lwmr cpplib build failed — lwmr method unavailable"
-# Open3D C++ SDK (README pins 0.16) — needed by create_delaunay's CMake
-RUN wget -q https://github.com/isl-org/Open3D/releases/download/v0.16.0/open3d-devel-linux-x86_64-cxx11-abi-0.16.0.tar.xz \
-        -O /tmp/open3d-devel.tar.xz && \
-    mkdir -p /opt/open3d-devel && \
-    tar -xJf /tmp/open3d-devel.tar.xz -C /opt/open3d-devel --strip-components=1 && \
-    rm /tmp/open3d-devel.tar.xz || \
-    echo "WARNING: Open3D C++ SDK download failed — lwmr method unavailable"
-RUN cd /opt/lwmr/models/delaunay_meshing/create_delaunay && \
-    cmake -DCMAKE_INSTALL_PREFIX=/opt/open3d-devel . && make && \
-    cd ../create_mesh && \
-    cmake -DCMAKE_INSTALL_PREFIX=/opt/open3d-devel . && make || \
-    echo "WARNING: lwmr Delaunay binaries build failed — lwmr method unavailable"
-
 # ── 7. Pipeline modules ───────────────────────────────────────────────────────
 COPY pointcloud_utils.py mesh_utils.py sdf_generator.py pipeline.py remesh.py /app/
 

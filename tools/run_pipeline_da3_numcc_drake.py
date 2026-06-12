@@ -180,8 +180,7 @@ def stage_convert(
       depth_full.npy   — full (unmasked) depth, float32 meters, for seen_xyz in NU-MCC
       mask.npy         — SAM2 binary mask resized to depth resolution, uint8
       intrinsics.json  — {fx, fy, cx, cy} from DA3 camera decoder
-      <stem>_color.png  — ORIGINAL color image, unmasked (for numcc --color)
-      <stem>_masked.png — white-background version, inspection only
+      <stem>_masked.png — color image with background → white (for numcc --color)
 
     The mask is passed separately so numcc can:
       1. Back-project the FULL depth to get the scene point cloud
@@ -243,24 +242,17 @@ def stage_convert(
     intri_out = work_dir / "intrinsics.json"
     intri_out.write_text(json.dumps({"fx": fx, "fy": fy, "cx": cx, "cy": cy}, indent=2))
 
-    # ── color: ORIGINAL image (unmasked) — matches NU-MCC training/demo ──────
-    # The SAM2 mask already restricts seen_xyz/valid_seen inside the container;
-    # CO3D training and demo_iphone.py feed the full RGB crop with its real
-    # background. A white background is out-of-distribution for the encoder.
+    # ── color: original image + white background outside object mask ──────────
     img = np.array(PILImage.open(str(original_image)).convert("RGB"))
     img_H, img_W = img.shape[:2]
-    color_out = work_dir / (original_image.stem + "_color.png")
-    PILImage.fromarray(img).save(str(color_out))
-
-    # White-background version kept only for visual inspection.
     color_mask_img = PILImage.fromarray(mask_orig.astype(np.uint8) * 255).resize(
         (img_W, img_H), PILImage.NEAREST
     )
     color_mask = np.asarray(color_mask_img) > 0
     color_masked = img.copy()
     color_masked[~color_mask] = 255  # white background outside object
-    masked_out = work_dir / (original_image.stem + "_masked.png")
-    PILImage.fromarray(color_masked).save(str(masked_out))
+    color_out = work_dir / (original_image.stem + "_masked.png")
+    PILImage.fromarray(color_masked).save(str(color_out))
 
     # ── depth visualization PNG ───────────────────────────────────────────────
     vis_out = work_dir / "depth_vis.png"

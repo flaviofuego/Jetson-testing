@@ -161,11 +161,6 @@ def mode_full_pipeline(args):
         "--n-query",       str(args.n_query),
         "--udf-n-iter",    str(args.udf_n_iter),
         "--poisson-depth", str(args.poisson_depth),
-        "--sap-grid-res",  str(args.sap_grid_res),
-        "--sap-sigma",     str(args.sap_sigma),
-        "--lwmr-sdf-iters", str(args.lwmr_sdf_iters),
-        "--lwmr-vg-iters",  str(args.lwmr_vg_iters),
-        "--lwmr-vertices",  str(args.lwmr_vertices),
     ]
     if color_arg:
         cmd += ["--color", color_arg]
@@ -190,9 +185,6 @@ def mode_full_pipeline(args):
 
 def mode_remesh(args):
     """Solo remesh: load PLY → mesh → SDF (salta NU-MCC)."""
-    if args.mesh_method == "both":
-        sys.exit("ERROR: --mesh-method both no soportado en modo remesh "
-                 "(elegir poisson, noksr, sap o lwmr)")
     cloud = _abs(args.cloud)
     if not cloud.exists():
         sys.exit(f"ERROR: cloud file not found: {cloud}")
@@ -214,11 +206,6 @@ def mode_remesh(args):
         "--output",        "/output",
         "--mesh-method",   args.mesh_method,
         "--poisson-depth", str(args.poisson_depth),
-        "--sap-grid-res",  str(args.sap_grid_res),
-        "--sap-sigma",     str(args.sap_sigma),
-        "--lwmr-sdf-iters", str(args.lwmr_sdf_iters),
-        "--lwmr-vg-iters",  str(args.lwmr_vg_iters),
-        "--lwmr-vertices",  str(args.lwmr_vertices),
     ]
 
     rc = run(cmd)
@@ -253,23 +240,10 @@ def main():
     p.add_argument("--name",          required=True,
                    help="Nombre del asset (determina carpeta de salida)")
     p.add_argument("--mesh-method",   default="noksr",
-                   choices=["poisson", "noksr", "sap", "lwmr", "both"],
-                   help="Método de reconstrucción de mesh (default: noksr). "
-                        "sap = Shape As Points/DPSR (rápido, sin checkpoint); "
-                        "lwmr = LightweightMR CVPR 2025 (low-poly, optimización "
-                        "por objeto ~10-30 min); both = poisson+noksr")
+                   choices=["poisson", "noksr"],
+                   help="Método de reconstrucción de mesh (default: noksr)")
     p.add_argument("--poisson-depth", default=10, type=int,
                    help="Profundidad octree Poisson (default 10)")
-    p.add_argument("--sap-grid-res",  default=256, type=int,
-                   help="Resolución de grid SAP/DPSR (default 256)")
-    p.add_argument("--sap-sigma",     default=2.0, type=float,
-                   help="Suavizado gaussiano SAP/DPSR (default 2.0)")
-    p.add_argument("--lwmr-sdf-iters", default=20_000, type=int,
-                   help="Iteraciones SDF LightweightMR (default 20000)")
-    p.add_argument("--lwmr-vg-iters",  default=8_000, type=int,
-                   help="Iteraciones vertex-generation LightweightMR (default 8000)")
-    p.add_argument("--lwmr-vertices",  default=3_400, type=int,
-                   help="Vértices de salida LightweightMR (default 3400)")
     p.add_argument("--skip-sam2",     action="store_true",
                    help="No correr SAM2 aunque no haya --mask (corre numcc sin máscara)")
 
@@ -278,9 +252,8 @@ def main():
                    help="NU-MCC UDF threshold (default 0.23)")
     p.add_argument("--n-query",       default=200_000, type=int,
                    help="Puntos de query UDF (default 200000)")
-    p.add_argument("--udf-n-iter",    default=10, type=int,
-                   help="Iteraciones move_points (default 10, igual que "
-                        "demo_iphone.py upstream)")
+    p.add_argument("--udf-n-iter",    default=3, type=int,
+                   help="Iteraciones move_points (default 3)")
     p.add_argument("--no-p2c",        action="store_true",
                    help="Saltar etapa P2C (usar nube de depth directamente)")
     p.add_argument("--no-floor-cap", action="store_true",

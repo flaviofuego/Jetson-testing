@@ -69,9 +69,6 @@ tools/
   download_models_numcc.py          # descarga pesos P2C (Google Drive) y NU-MCC (S3)
   download_models_trellis_windows.py # descarga modelos TRELLIS en Windows + scp a Jetson
   ply_to_obj.py             # convierte PLY gaussiano (dvlt) a OBJ mesh
-  mesh_filter.py            # aplica filtros MeshLab a OBJ: smooth normals, depth smooth, clustering decimation
-  smooth_preserve.py        # suaviza mesh eliminando grumos sin perder detalle geométrico (Taubin + Two Steps)
-  apply_mlx.py              # aplica cualquier script .mlx de MeshLab a un mesh
 data/
   images/               # imágenes de entrada
   outputs/              # salidas de SAM2 (viz, máscaras, recortes)
@@ -163,7 +160,7 @@ python3 tools/run_numcc.py \
     --name   objeto \
     --intrinsics data/outputs/pipeline/objeto/numcc_input/intrinsics.json \
     --mask   data/outputs/pipeline/objeto/numcc_input/mask.npy \
-    --mesh-method noksr          # o poisson / sap / lwmr
+    --mesh-method noksr          # o poisson
 
 # Solo remesh desde nube de puntos existente (salta NU-MCC, muy rápido)
 python3 tools/run_numcc.py \
@@ -179,7 +176,7 @@ docker run --rm --gpus all \
     -v "$(pwd)/assets":/output \
     numcc:x86 \
     --depth /input/depth_full.npy \
-    --color /input/nombre_color.png \
+    --color /input/nombre_masked.png \
     --mask  /input/mask.npy \
     --intrinsics /input/intrinsics.json \
     --name nombre_objeto \
@@ -209,25 +206,16 @@ docker run --rm --gpus all \
 - `seen_images`: 800×800 obligatorio (assert en preprocess_img); canal alpha eliminado si RGBA
 - Normalización de seen_xyz: stats computadas sobre píxeles de objeto únicamente (máscara aplicada antes de normalizar)
 
-**`move_points` es crítico:** después del filtro por UDF threshold, cada punto candidato se refina por descenso de gradiente sobre el campo UDF (`udf_n_iter=10` iteraciones, default de demo_iphone.py). Sin esto la superficie es muy escasa e irregular.
-
-**Inputs RGB y máscara (alineados con demo_iphone.py upstream):**
-- `--color` debe ser la imagen ORIGINAL sin enmascarar — CO3D training y el demo usan el crop RGB con su fondo real; fondo blanco es out-of-distribution para el encoder. El pipeline DA3 ahora genera `<stem>_color.png` (original) y la pasa a numcc; `<stem>_masked.png` queda solo para inspección.
-- La máscara SAM2 se erosiona 2 px dentro de `run_numcc` antes de aplicarla a seen_xyz — elimina flying pixels del depth de DA3 en la silueta (el demo upstream logra lo mismo gratis: su resize bilinear propaga inf a los píxeles de borde). Guard: si la erosión deja <64 px se salta.
+**`move_points` es crítico:** después del filtro por UDF threshold, cada punto candidato se refina por descenso de gradiente sobre el campo UDF (`udf_n_iter=3` iteraciones). Sin esto la superficie es muy escasa e irregular.
 
 **Métodos de reconstrucción de mesh (`--mesh-method`):**
 
-| Método | Faces típicas | Tiempo | Descripción |
-|--------|--------------|--------|-------------|
-| `noksr` (default) | ~260K | ~15-20s | nksr Neural Kernel Surface Reconstruction — prior aprendido, mejor en zonas dispersas |
-| `poisson` | ~140K | ~5-10s | Open3D Screened Poisson — más suave, menor conteo de caras |
-| `sap` | ~500K @ 256³ | ~3-5s | Shape As Points / DPSR (Peng et al. 2021) — Poisson espectral (FFT), sin checkpoint ni optimización; `--sap-grid-res` (256 default, 128 = menos caras) y `--sap-sigma` (2.0) |
-| `lwmr` | ~6-7K (3400 vértices) | ~10-30 min | LightweightMR (CVPR 2025) — SDF neural + vértices adaptativos a curvatura + Delaunay CGAL; malla low-poly directa sin decimation. `--lwmr-sdf-iters` (20000), `--lwmr-vg-iters` (8000), `--lwmr-vertices` (3400). Optimización POR OBJETO — lento |
-| `both` | - | - | poisson + noksr para comparación; `{name}.obj` usa noksr |
+| Método | Faces típicas | Descripción |
+|--------|--------------|-------------|
+| `noksr` (default) | ~260K | nksr Neural Kernel Surface Reconstruction — prior aprendido, mejor en zonas dispersas |
+| `poisson` | ~140K | Open3D Screened Poisson — más suave, menor conteo de caras, más rápido |
 
-nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. Para Drake: `poisson`/`sap` si se necesitan menos partes CoACD; `lwmr` da la malla más liviana (ideal colisión) pero tarda. Si un método falla (deps faltantes), el pipeline cae a poisson con warning.
-
-**Rebuild requerido para sap/lwmr:** `sap` necesita PyMCubes y `lwmr` necesita el repo + binarios CGAL + Open3D C++ SDK — ambos se instalan en `numcc/Dockerfile.x86` (secciones 6b/6c, best-effort). Rebuild: `docker build -t numcc:x86 -f numcc/Dockerfile.x86 numcc/`. Sin rebuild ambos métodos caen a poisson.
+nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resultado tiene mayor resolución geométrica pero CoACD genera más partes convexas. Para Drake, ambos son válidos — usar `poisson` si se necesitan menos partes CoACD.
 
 **Outputs en `assets/<nombre>/`:**
 - `<nombre>.obj` — mesh final (método elegido)
@@ -269,8 +257,6 @@ python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name obje
 - `numcc_input/depth_full.npy` — depth métrico (metros, clip [0.05, 20])
 - `numcc_input/intrinsics.json` — intrínsecos estimados por DA3
 - `numcc_input/mask.npy` — máscara SAM2 redimensionada a resolución del depth
-- `numcc_input/<stem>_color.png` — imagen original sin enmascarar (input --color de numcc)
-- `numcc_input/<stem>_masked.png` — versión fondo blanco, solo inspección
 - `vram_profile.csv` — uso de VRAM por stage
 
 ### dvlt — reconstrucción gaussiana
@@ -351,55 +337,6 @@ wsl rsync -av jetson@192.168.1.43:~/Jetson-testing/assets/ /mnt/c/Users/flavi/..
 # Meshes dvlt
 wsl rsync -av jetson@192.168.1.43:~/dvlt.cu/meshes/ /mnt/c/Users/flavi/.../dvlt.cu/meshes/
 ```
-
-## Post-procesado de mesh (PyMeshLab)
-
-PyMeshLab instalado en el venv del proyecto (`.venv`). Permite aplicar filtros MeshLab por CLI sin abrir la GUI.
-
-```bash
-# Instalar (ya hecho)
-uv pip install pymeshlab
-```
-
-### smooth_preserve.py — suavizado preservando geometría
-
-Secuencia recomendada para eliminar grumos manteniendo bordes y detalle:
-1. Clustering Decimation — reduce faces primero
-2. Taubin Smooth — suaviza sin encoger el mesh (mejor que Laplacian)
-3. Two Steps Smoothing — alisa zonas planas, preserva aristas por ángulo
-4. Smooth Face Normals — limpia normales al final
-
-```bash
-# Uso básico
-.venv/bin/python3 tools/smooth_preserve.py input.obj output.obj
-
-# Ajustar agresividad (más iter = más liso; angle menor = preserva más bordes)
-.venv/bin/python3 tools/smooth_preserve.py input.obj output.obj \
-    --taubin-iter 20 --twosteps-iter 5 --feature-angle 30
-```
-
-### mesh_filter.py — filtros individuales
-
-```bash
-.venv/bin/python3 tools/mesh_filter.py input.obj output.obj \
-    --smooth-normals --smooth-iter 4 \
-    --depth-smooth --depth-smooth-iter 4 \
-    --cluster-decimation --threshold 0.3
-```
-
-### apply_mlx.py — aplicar script exportado desde GUI MeshLab
-
-Exportar desde MeshLab GUI: Filters → Show current filter script → Save Script (.mlx)
-
-```bash
-.venv/bin/python3 tools/apply_mlx.py input.obj output.obj assets/Scripts/mi_script.mlx
-```
-
-**Scripts MLX guardados en `assets/Scripts/`:**
-- `script_smoothing.mlx` — secuencia de smooth normals + clustering decimation + depth smooth aplicada en GUI
-- `script_smooth_preserve.mlx` — clustering + Taubin + Two Steps (recomendado)
-
-**Nota:** assets generados por Docker son de root — hacer `sudo chown -R $USER:$USER assets/` antes de guardar con PyMeshLab.
 
 ## Modelos y caché
 
