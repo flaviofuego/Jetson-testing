@@ -881,12 +881,18 @@ def _points_to_mesh_lwmr(
     (work / "vg.conf").write_text(vg_conf)
 
     # Both scripts resolve ./models/... relative paths — must run from the repo.
+    # PYTHONPATH must be cleared: the image exports /opt/p2c, whose regular
+    # `models` package (has __init__.py) shadows LightweightMR's namespace
+    # `models` package and breaks `from models.cpplib.libkdtree import KDTree`.
+    import os
+    lwmr_env = {**os.environ, "PYTHONPATH": ""}
+
     def _run(script: str, mode: str, extra: list[str]):
         cmd = [_sys.executable, script, "--mode", mode, "--gpu", "0",
                "--datadir", f"{datadir}/", "--expdir", f"{expdir}/",
                "--dataname", name] + extra
         print(f"       lwmr: {script} --mode {mode} ...")
-        subprocess.run(cmd, cwd=str(lwmr_root), check=True)
+        subprocess.run(cmd, cwd=str(lwmr_root), check=True, env=lwmr_env)
 
     try:
         _run("run_sdf.py", "train",
