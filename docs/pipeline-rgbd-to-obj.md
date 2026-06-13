@@ -94,7 +94,7 @@ flowchart TD
     SAM2 --> SAM2_OUT
 
     subgraph CONVERT["Stage 3 — Preparación inputs"]
-        CONV["stage_convert()\nrun_pipeline_da3_numcc_drake.py"]
+        CONV["stage_prepare()\npipeline.py"]
         CONV_OUT["depth_full.npy float32 m\nmask.npy uint8\nintrinsics.json\nstem_masked.png"]
     end
 
@@ -152,7 +152,7 @@ flowchart TD
 
 | Componente | Tipo | Descripción |
 |------------|------|-------------|
-| `run_pipeline_da3_numcc_drake.py` | Orquestador Python | Encadena DA3→SAM2→convert→numcc→Drake con monitoreo VRAM |
+| `pipeline.py` | Orquestador Python | Encadena DA3→SAM2→convert→numcc→Drake con monitoreo VRAM |
 | `run_numcc.py` | Wrapper Python | Interfaz simplificada al Docker numcc:x86 |
 | `numcc/pipeline.py` | ENTRYPOINT Docker | Pipeline completo dentro del container |
 | `numcc/pointcloud_utils.py` | Módulo | Carga depth, back-projection, conversión Y-up |
@@ -195,13 +195,13 @@ Estimar un mapa de profundidad métrico en metros desde una imagen RGB monocular
 | Archivo | Ubicación | Función |
 |---------|-----------|---------|
 | `da3` CLI | `/home/worker-node-4/Documents/GitHub/UniWhere/.venv/bin/da3` | CLI de DA3 |
-| `results.npz` | `data/outputs/pipeline/<name>/da3_raw/` | Salida del modelo |
+| `results.npz` | `output/<name>/01_da3/` | Salida del modelo |
 
 #### Scripts ejecutados
 
 | Script | Ruta | Función |
 |--------|------|---------|
-| `stage_da3()` | `tools/run_pipeline_da3_numcc_drake.py:107` | Llama a DA3 CLI y recoge el NPZ |
+| `stage_da3()` | `tools/pipeline.py:169` | Llama a DA3 CLI y recoge el NPZ |
 
 #### Comandos
 
@@ -212,7 +212,7 @@ source /home/worker-node-4/Documents/GitHub/UniWhere/.venv/bin/activate
 # Depth map en formato NPZ (para pipeline numcc)
 da3 image data/images/objeto.jpg \
     --export-format npz \
-    --export-dir data/outputs/pipeline/objeto/da3_raw \
+    --export-dir output/objeto/01_da3 \
     --auto-cleanup
 
 # Solo visualización
@@ -237,7 +237,7 @@ El modelo procesa la imagen a resolución reducida (ej. 504×378 para 1156×868 
 
 | Output | Tipo | Formato | Destino |
 |--------|------|---------|---------|
-| `results.npz` | Array NumPy | NPZ | `data/outputs/pipeline/<name>/da3_raw/` |
+| `results.npz` | Array NumPy | NPZ | `output/<name>/01_da3/` |
 
 **Claves del NPZ:**
 
@@ -260,7 +260,7 @@ El modelo procesa la imagen a resolución reducida (ej. 504×378 para 1156×868 
 | Problema | Síntoma | Causa | Solución |
 |---------|---------|-------|----------|
 | `da3: command not found` | Error al ejecutar | Venv no activado | `source /path/to/UniWhere/.venv/bin/activate` |
-| NPZ sin clave `intrinsics` | KeyError | Versión antigua DA3 | Fallback en `stage_convert()`: usa 60° HFOV |
+| NPZ sin clave `intrinsics` | KeyError | Versión antigua DA3 | Fallback en `stage_prepare()`: usa 60° HFOV |
 | Depth muy pequeño (mm) | Valores < 0.01 | Versión DA3 relativa | No aplica con DA3NESTED-GIANT-LARGE |
 | `reference_view_strategy` KeyError | Crash en CLI | Bug en `cli.py` | Corregido en fork: `ref_view_strategy` (4 ocurrencias) |
 
@@ -301,19 +301,19 @@ Segmentar el objeto principal en la imagen RGB y generar: (a) imagen con fondo b
 
 | Script | Ruta | Función |
 |--------|------|---------|
-| `stage_sam2()` | `tools/run_pipeline_da3_numcc_drake.py:133` | Lanza Docker SAM2 |
+| `stage_sam2()` | `tools/pipeline.py:237` | Lanza Docker SAM2 |
 | `sam2/pipeline.py:main()` | `sam2/pipeline.py:98` | ENTRYPOINT del container |
 
 #### Comandos
 
 ```bash
 # Via pipeline completo (recomendado)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto
+python3 tools/pipeline.py data/images/objeto.jpg --name objeto
 
 # Via run_numcc.py (SAM2 automático si no se provee --mask)
 python3 tools/run_numcc.py \
     --image data/images/objeto.jpg \
-    --depth data/outputs/pipeline/objeto/numcc_input/depth_full.npy \
+    --depth output/objeto/03_numcc_inputs/depth_full.npy \
     --name objeto
 
 # Docker directo
@@ -383,12 +383,12 @@ Convertir los outputs de DA3 (NPZ) y SAM2 (máscara) en el formato exacto que es
 
 | Archivo | Ubicación | Función |
 |---------|-----------|---------|
-| `stage_convert()` | `tools/run_pipeline_da3_numcc_drake.py:172` | Genera todos los inputs numcc |
+| `stage_prepare()` | `tools/pipeline.py:280` | Genera todos los inputs numcc |
 
 #### Comandos
 
 ```bash
-# Stage 3 se ejecuta automáticamente dentro de run_pipeline_da3_numcc_drake.py
+# Stage 3 se ejecuta automáticamente dentro de pipeline.py
 # No hay comando standalone — forma parte del pipeline orquestado
 ```
 
@@ -422,11 +422,11 @@ PILImage.fromarray(color_masked).save(work_dir / f"{stem}_masked.png")
 
 | Output | Tipo | Formato | Destino |
 |--------|------|---------|---------|
-| `depth_full.npy` | Depth métrico | NPY float32 `(H, W)` metros | `data/outputs/pipeline/<name>/numcc_input/` |
-| `mask.npy` | Máscara objeto | NPY uint8 `(H, W)` | `data/outputs/pipeline/<name>/numcc_input/` |
-| `intrinsics.json` | Intrínsecos | JSON `{fx, fy, cx, cy}` | `data/outputs/pipeline/<name>/numcc_input/` |
-| `<stem>_masked.png` | Color masked | PNG RGB | `data/outputs/pipeline/<name>/numcc_input/` |
-| `depth_vis.png` | Visualización | PNG | `data/outputs/pipeline/<name>/numcc_input/` |
+| `depth_full.npy` | Depth métrico | NPY float32 `(H, W)` metros | `output/<name>/03_numcc_inputs/` |
+| `mask.npy` | Máscara objeto | NPY uint8 `(H, W)` | `output/<name>/03_numcc_inputs/` |
+| `intrinsics.json` | Intrínsecos | JSON `{fx, fy, cx, cy}` | `output/<name>/03_numcc_inputs/` |
+| `<stem>_masked.png` | Color masked | PNG RGB | `output/<name>/03_numcc_inputs/` |
+| `depth_vis.png` | Visualización | PNG | `output/<name>/03_numcc_inputs/` |
 
 #### Troubleshooting
 
@@ -521,7 +521,7 @@ model = P2C(config)
 completed = model(pts_t)  # (1, M, 3) directo, sin dict wrapper
 ```
 
-El pipeline usa `--no-p2c` por defecto en `run_pipeline_da3_numcc_drake.py` porque el checkpoint actual tiene mismatch de arquitectura. La nube de depth cruda es suficiente para NU-MCC.
+El pipeline usa `--no-p2c` por defecto en `pipeline.py` porque el checkpoint actual tiene mismatch de arquitectura. La nube de depth cruda es suficiente para NU-MCC.
 
 **Salida:** `<name>_pointcloud.npy` — nube P2C en Y-up (si P2C funcionó)
 
@@ -779,7 +779,7 @@ Validar que el SDF generado sea parseable por Drake (carga correcta del modelo, 
 
 | Script | Ruta | Función |
 |--------|------|---------|
-| `stage_drake()` | `tools/run_pipeline_da3_numcc_drake.py:392` | Ejecuta validación o Meshcat |
+| `stage_drake()` | `tools/pipeline.py:540` | Ejecuta validación o Meshcat |
 | `_DRAKE_VALIDATE` | Inline en script | Python inline: Parser.AddModels + Finalize |
 | `_DRAKE_MESHCAT` | Inline en script | Python inline: StartMeshcat + visualización |
 
@@ -787,10 +787,10 @@ Validar que el SDF generado sea parseable por Drake (carga correcta del modelo, 
 
 ```bash
 # Validación rápida (no interactiva)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto
+python3 tools/pipeline.py data/images/objeto.jpg --name objeto
 
 # Visualización Meshcat (bloquea hasta Ctrl+C)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --drake-interactive
 ```
 
@@ -877,9 +877,9 @@ sudo chown -R $USER:$USER assets/
 
 | Etapa | Input | Transformación | Output | Ubicación |
 |-------|-------|---------------|--------|-----------|
-| DA3 | `imagen.jpg` | Monocular depth estimation (transformer) | `results.npz` | `data/outputs/pipeline/<name>/da3_raw/` |
+| DA3 | `imagen.jpg` | Monocular depth estimation (transformer) | `results.npz` | `output/<name>/01_da3/` |
 | SAM2 | `imagen.jpg` | Segmentación automática SAM2.1 small | `<name>_segmask.npy`, `<name>.png` | `data/outputs/` |
-| Preparación | `results.npz` + `<name>_segmask.npy` | Clip depth, resize mask, extraer intrínsecas | `depth_full.npy`, `mask.npy`, `intrinsics.json`, `<stem>_masked.png` | `data/outputs/pipeline/<name>/numcc_input/` |
+| Preparación | `results.npz` + `<name>_segmask.npy` | Clip depth, resize mask, extraer intrínsecas | `depth_full.npy`, `mask.npy`, `intrinsics.json`, `<stem>_masked.png` | `output/<name>/03_numcc_inputs/` |
 | Load depth | `depth_full.npy` | `np.load().astype(float32)` | `depth (H,W) float32 metros` | memoria |
 | Back-projection | `depth (H,W)`, `fx,fy,cx,cy` | Pinhole model: `X=(u-cx)*Z/fx` | `all_pts (N,3) camera frame` | memoria |
 | Mask filter | `all_pts`, `mask.npy` | Boolean index con resize NEAREST | `object_pts (M,3)`, `object_colors (M,3)` | memoria |
@@ -1055,7 +1055,7 @@ docker build -t numcc:x86 -f models/numcc/Dockerfile.x86 .
 docker run --rm --gpus all \
     -v ~/models/numcc:/opt/models:ro \
     -v ~/models/nksr_cache:/root/.cache/torch \
-    -v "$(pwd)/data/outputs/pipeline/objeto/numcc_input":/input:ro \
+    -v "$(pwd)/output/objeto/03_numcc_inputs":/input:ro \
     -v "$(pwd)/assets":/output \
     numcc:x86 \
     --depth      /input/depth_full.npy \
@@ -1090,7 +1090,7 @@ docker run --rm --gpus all \
 docker run --rm --gpus all \
     -v ~/models/numcc:/opt/models:ro \
     -v ~/models/nksr_cache:/root/.cache/torch \
-    -v "$(pwd)/data/outputs/pipeline/objeto/numcc_input":/input:ro \
+    -v "$(pwd)/output/objeto/03_numcc_inputs":/input:ro \
     -v "$(pwd)/assets":/output \
     numcc:x86 \
     --depth /input/depth_full.npy \
@@ -1137,7 +1137,7 @@ docker run --rm --gpus all \
 
 ## 8. Scripts y Automatización
 
-### 8.1 `tools/run_pipeline_da3_numcc_drake.py`
+### 8.1 `tools/pipeline.py`
 
 **Propósito:** Orquestador del pipeline completo DA3 → SAM2 → preparación → numcc → Drake con monitoreo de VRAM por stage.
 
@@ -1158,7 +1158,7 @@ docker run --rm --gpus all \
 1. `VRAMMonitor(poll_ms=200)` — thread de background, polling nvidia-smi cada 200ms
 2. `stage_da3()` — ejecuta CLI da3 con `--export-format npz`
 3. `stage_sam2()` — Docker sam2:x86
-4. `stage_convert()` — Python puro: clip depth, resize mask, extraer intrínsecas, color masked
+4. `stage_prepare()` — Python puro: clip depth, resize mask, extraer intrínsecas, color masked
 5. `stage_numcc()` — Docker numcc:x86 con `--no-p2c`
 6. `stage_drake()` — `uv run python3 script_tempfile.py sdf_path`
 7. `print_report()` — tabla VRAM por stage + CSV
@@ -1170,7 +1170,7 @@ data/images/<name>.jpg
 
 **Outputs:**
 ```
-data/outputs/pipeline/<name>/
+output/<name>/
     da3_raw/exports/npz/results.npz
     numcc_input/
         depth_full.npy
@@ -1195,7 +1195,7 @@ assets/<name>/
 - `--depth` → pipeline completo
 - `--cloud` → solo remesh (salta NU-MCC)
 
-**Nota:** `--udf-n-iter` default = 3 en este wrapper (vs 10 en `run_pipeline_da3_numcc_drake.py`). Para mayor calidad de superficie usar `--udf-n-iter 10`.
+**Nota:** `--udf-n-iter` default = 3 en este wrapper (vs 10 en `pipeline.py`). Para mayor calidad de superficie usar `--udf-n-iter 10`.
 
 ### 8.3 `numcc/pipeline.py`
 
@@ -1394,7 +1394,7 @@ docker run --rm --gpus all numcc:x86 --help
 ### 10.8 Primera ejecución completa
 
 ```bash
-python3 tools/run_pipeline_da3_numcc_drake.py \
+python3 tools/pipeline.py \
     data/images/lapicero.jpg --name lapicero
 # Tiempo esperado: ~80s total
 # VRAM pico: ~9.4 GB
@@ -1411,18 +1411,18 @@ python3 tools/run_pipeline_da3_numcc_drake.py \
 source /home/worker-node-4/Documents/GitHub/UniWhere/.venv/bin/activate
 
 # Pipeline completo
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto
+python3 tools/pipeline.py data/images/objeto.jpg --name objeto
 
 # Saltar stages ya calculados
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --skip-da3 --skip-sam2
 
 # Con visualización Drake
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --drake-interactive
 
 # UDF threshold relajado (objetos pequeños o monoculares con pocas partes)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --udf-threshold 0.10
 ```
 
@@ -1433,7 +1433,7 @@ python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name obje
 source /home/worker-node-4/Documents/GitHub/UniWhere/.venv/bin/activate
 da3 image data/images/objeto.jpg \
     --export-format npz \
-    --export-dir data/outputs/pipeline/objeto/da3_raw \
+    --export-dir output/objeto/01_da3 \
     --auto-cleanup
 
 # Step 2: SAM2
@@ -1448,7 +1448,7 @@ docker run --rm --gpus all \
 # Step 3: numcc (via wrapper con SAM2 ya hecho)
 python3 tools/run_numcc.py \
     --image  data/images/objeto.jpg \
-    --depth  data/outputs/pipeline/objeto/numcc_input/depth_full.npy \
+    --depth  output/objeto/03_numcc_inputs/depth_full.npy \
     --mask   data/outputs/objeto_segmask.npy \
     --name   objeto \
     --mesh-method noksr
@@ -1516,7 +1516,7 @@ print('OK')
 ```bash
 python3 -c "
 import numpy as np
-data = np.load('data/outputs/pipeline/objeto/da3_raw/exports/npz/results.npz', allow_pickle=True)
+data = np.load('output/objeto/01_da3/exports/npz/results.npz', allow_pickle=True)
 print('Keys:', list(data.keys()))
 d = data['depth'][0]
 print(f'Depth shape: {d.shape}  range: [{d.min():.3f}, {d.max():.3f}] m')
@@ -1536,14 +1536,14 @@ print(f'Mask shape: {mask.shape}  object px: {mask.sum()}  total: {mask.size}')
 
 **numcc — inputs preparados:**
 ```bash
-ls -la data/outputs/pipeline/objeto/numcc_input/
+ls -la output/objeto/03_numcc_inputs/
 # Esperado: depth_full.npy, mask.npy, intrinsics.json, <stem>_masked.png
 
 python3 -c "
 import numpy as np, json
-d = np.load('data/outputs/pipeline/objeto/numcc_input/depth_full.npy')
-m = np.load('data/outputs/pipeline/objeto/numcc_input/mask.npy')
-k = json.load(open('data/outputs/pipeline/objeto/numcc_input/intrinsics.json'))
+d = np.load('output/objeto/03_numcc_inputs/depth_full.npy')
+m = np.load('output/objeto/03_numcc_inputs/mask.npy')
+k = json.load(open('output/objeto/03_numcc_inputs/intrinsics.json'))
 print(f'depth: {d.shape} [{d.min():.3f},{d.max():.3f}] m')
 print(f'mask: {m.shape} {m.sum()} object px')
 print(f'intrinsics: {k}')
@@ -1584,14 +1584,28 @@ print(f'Bodies: {p.num_bodies()}  Frames: {p.num_frames()}')
 ### 12.2 Archivos esperados tras pipeline completo
 
 ```
-data/outputs/pipeline/<name>/
-├── da3_raw/exports/npz/results.npz       # DA3 output
-├── numcc_input/
+output/<name>/                            # pipeline.py output root
+├── 01_da3/                               # DA3 outputs
+│   ├── results.npz
+│   ├── depth_full.npy
+│   └── intrinsics.json
+├── 02_sam2/                              # SAM2 outputs
+│   ├── segmask.npy
+│   └── <stem>_masked.png
+├── 03_numcc_inputs/                      # Prepared numcc inputs
 │   ├── depth_full.npy                    # float32 metros (H,W)
 │   ├── mask.npy                          # uint8 (H,W) 0/1
 │   ├── intrinsics.json                   # {fx,fy,cx,cy}
 │   ├── <stem>_masked.png                 # color con fondo blanco
 │   └── depth_vis.png                     # visualización 3-panel
+├── 04_pointcloud/                        # Point clouds
+│   ├── <name>_object_cloud.ply
+│   └── <name>_numcc_surface.ply
+├── 05_mesh/                              # Mesh final
+│   ├── <name>.obj
+│   ├── <name>.sdf
+│   └── <name>_parts/
+├── pipeline_report.json                  # tiempos, VRAM, parámetros
 └── vram_profile.csv                      # VRAM por timestamp
 
 assets/<name>/<name>/
@@ -1652,7 +1666,7 @@ Done in 55.3s
 
 ### 13.2 Monitoreo VRAM
 
-`VRAMMonitor` en `run_pipeline_da3_numcc_drake.py`:
+`VRAMMonitor` en `pipeline.py`:
 - Polling nvidia-smi cada 200ms en thread de background
 - Registra `(timestamp, used_mb)` en lista
 - Al final: tabla de peak VRAM por stage + CSV
@@ -1665,7 +1679,7 @@ Done in 55.3s
   numcc              9400       +9058       50.9
   Drake               342           0        0.6
 
-  Profile: data/outputs/pipeline/objeto/vram_profile.csv
+  Profile: output/objeto/vram_profile.csv
 ```
 
 ### 13.3 Debug dump NU-MCC
@@ -1806,20 +1820,23 @@ Jetson-testing/
 │   └── trellis/                        # Pipeline TRELLIS (alternativa 1 imagen)
 │
 ├── tools/
-│   ├── run_pipeline_da3_numcc_drake.py # Orquestador completo DA3→numcc→Drake
-│   ├── run_numcc.py                    # Wrapper simplificado numcc
-│   ├── generate_asset.py               # Wrapper multi-pipeline (sam2/triposr/trellis/numcc)
+│   ├── pipeline.py                     # Super-pipeline: imagen → output/ estructurado por stages
+│   ├── generate_asset.py               # Wrapper simple (triposr/trellis/sam2/numcc)
+│   ├── run_numcc.py                    # Wrapper numcc avanzado (SAM2 auto, remesh, opciones)
+│   ├── capture_realsense.py            # Captura RGBD desde Intel RealSense
 │   ├── download_models_numcc.py        # Descarga P2C + NU-MCC
 │   ├── download_models.py              # Descarga TripoSR
 │   ├── download_models_trellis.py      # Descarga TRELLIS
-│   ├── ply_to_obj.py                   # Convierte PLY gaussiano a OBJ
-│   ├── smooth_preserve.py              # Suavizado preservando geometría
+│   ├── ply_to_obj.py                   # Convierte PLY gaussiano (dvlt) a OBJ
+│   ├── segment_objects.py              # Segmenta escena PLY multi-objeto
+│   ├── visualize_aira_npy.py           # Debug: npy AIRA → PNG + PLY
+│   ├── smooth_preserve.py              # Suavizado preservando geometría (recomendado)
 │   ├── mesh_filter.py                  # Filtros individuales MeshLab
 │   └── apply_mlx.py                    # Aplica script .mlx MeshLab
 │
+├── output/                             # pipeline.py outputs (por nombre de asset)
 ├── data/
 │   ├── images/                         # Imágenes de entrada
-│   ├── outputs/                        # Salidas SAM2, DA3, pipeline
 │   └── aira_input_data/
 │       └── intrinsics.json             # Intrínsecas cámara Drake (AIRA)
 │

@@ -63,17 +63,19 @@ models/
     sdf_generator.py
     requirements.txt
 tools/
-  generate_asset.py         # wrapper principal (soporta sam2, triposr, trellis, numcc)
-  run_numcc.py              # wrapper numcc: full pipeline o solo remesh, elige nksr/poisson
-  run_pipeline_da3_numcc_drake.py  # pipeline completo DA3 → SAM2 → numcc → Drake
-  download_models.py        # descarga modelos TripoSR en la Jetson
-  download_models_trellis.py        # descarga modelos TRELLIS en la Jetson
-  download_models_numcc.py          # descarga pesos P2C (Google Drive) y NU-MCC (S3)
-  download_models_trellis_windows.py # descarga modelos TRELLIS en Windows + scp a Jetson
-  ply_to_obj.py             # convierte PLY gaussiano (dvlt) a OBJ mesh
-  mesh_filter.py            # aplica filtros MeshLab a OBJ: smooth normals, depth smooth, clustering decimation
-  smooth_preserve.py        # suaviza mesh eliminando grumos sin perder detalle geométrico (Taubin + Two Steps)
-  apply_mlx.py              # aplica cualquier script .mlx de MeshLab a un mesh
+  pipeline.py                    # super-pipeline unificado: imagen → output/ estructurado por stages
+  generate_asset.py              # wrapper simple (triposr, trellis, sam2, numcc) — casos básicos
+  run_numcc.py                   # wrapper numcc: full pipeline o solo remesh, elige nksr/poisson
+  capture_realsense.py           # captura RGBD desde Intel RealSense → depth.npy + color.npy + intrinsics.json
+  download_models.py             # descarga modelos TripoSR en la Jetson
+  download_models_trellis.py     # descarga modelos TRELLIS en la Jetson
+  download_models_numcc.py       # descarga pesos P2C (Google Drive) y NU-MCC (S3)
+  ply_to_obj.py                  # convierte PLY gaussiano (dvlt) a OBJ mesh
+  segment_objects.py             # segmenta escena multi-objeto PLY (dvlt) → OBJ por cluster
+  visualize_aira_npy.py          # debug: convierte .npy AIRA a PNG + PLY visualizable
+  mesh_filter.py                 # filtros MeshLab individuales (smooth normals, depth smooth, decimation)
+  smooth_preserve.py             # suavizado preservando geometría (Taubin + Two Steps) — recomendado
+  apply_mlx.py                   # aplica script .mlx exportado desde GUI MeshLab
 data/
   images/               # imágenes de entrada
   outputs/              # salidas de SAM2 (viz, máscaras, recortes)
@@ -260,31 +262,37 @@ Taza produce muchas partes CoACD porque DA3 monocular solo reconstruye la superf
 
 ### Pipeline completo DA3 → SAM2 → numcc → Drake
 
-Script que encadena todos los stages con monitoreo de VRAM:
+Script unificado `tools/pipeline.py` — encadena todos los stages con output organizado por subdirectorios y monitoreo de VRAM:
 
 ```bash
 # Pipeline completo (primera vez — corre todo)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto
+.venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto
 
-# Saltar stages ya calculados (reutiliza npz/mask existentes)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+# Saltar stages ya calculados
+.venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --skip-da3 --skip-sam2
 
 # Con visualización interactiva en Meshcat (bloquea hasta Ctrl+C)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+.venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --drake-interactive
 
 # Con UDF threshold relajado (recomendado para objetos pequeños/monoculares)
-python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name objeto \
+.venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --udf-threshold 0.10
+
+# Desde depth map ya calculado (salta DA3 y SAM2)
+.venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
+    --depth path/to/depth.npy --mask path/to/mask.npy --skip-da3 --skip-sam2
 ```
 
-**Outputs en `data/outputs/pipeline/<nombre>/`:**
-- `da3_raw/exports/npz/results.npz` — depth + intrínsecos + extrínsecos de DA3
-- `numcc_input/depth_full.npy` — depth métrico (metros, clip [0.05, 20])
-- `numcc_input/intrinsics.json` — intrínsecos estimados por DA3
-- `numcc_input/mask.npy` — máscara SAM2 redimensionada a resolución del depth
-- `numcc_input/<stem>_masked.png` — imagen con fondo blanco (se pasa como `--color` a numcc)
+**Outputs en `output/<nombre>/`:**
+- `01_da3/` — NPZ + depth_full.npy + intrinsics.json + depth_vis.png
+- `02_sam2/` — segmask.npy + imagen fondo blanco + viz.png
+- `03_numcc_inputs/` — depth_full.npy + mask.npy + intrinsics.json + *_masked.png
+- `04_pointcloud/` — *_object_cloud.ply + *_numcc_surface.ply
+- `05_mesh/` — <nombre>.obj + <nombre>.sdf + <nombre>_parts/
+- `06_debug/` — (solo con `--debug`) dump NU-MCC inputs/outputs
+- `pipeline_report.json` — tiempos, VRAM pico, parámetros, inventario de archivos
 - `vram_profile.csv` — uso de VRAM por stage
 
 ### dvlt — reconstrucción gaussiana
@@ -458,4 +466,4 @@ Los modelos se guardan en el host y se montan en Docker:
 - nksr wheel server (`nksr.huangjh.tech`) está permanentemente caído (NXDOMAIN); el submodulo es la única vía de instalación
 - nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — montar `~/models/nksr_cache:/root/.cache/torch` para no re-descargarlo en cada container
 - El gitignore cubre `/assets/` — ningún asset generado se commitea
-- `run_pipeline_da3_numcc_drake.py` y scripts de tools requieren `.venv/bin/python3` (no `python3` del sistema — no tiene numpy)
+- `pipeline.py` y scripts de tools requieren `.venv/bin/python3` (no `python3` del sistema — no tiene numpy)
