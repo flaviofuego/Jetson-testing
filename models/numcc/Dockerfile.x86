@@ -1,60 +1,87 @@
 # x86 GPU (Linux, CUDA 11.8+)
-# devel image includes nvcc + CUDA headers needed to compile C++/CUDA extensions
-FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
+# Two-stage build: devel to compile CUDA extensions, runtime for final image.
+# Saves ~4-5 GB by excluding nvcc, CUDA headers, and build tools from runtime.
 
-WORKDIR /app
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 1 — builder: compile all CUDA extensions + install all Python deps
+# ══════════════════════════════════════════════════════════════════════════════
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel AS builder
 
+# Build tools + spatial index headers (needed to compile rtree at install time)
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    cmake git g++ ninja-build libgl1 libglib2.0-0 libgomp1 tzdata libspatialindex-dev \
+        cmake git g++ ninja-build libspatialindex-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Upgrade pip only — do NOT upgrade setuptools, torch 2.1 needs the conda
-# setuptools that bundles pkg_resources (newer setuptools breaks cpp_extension).
 RUN pip install --no-cache-dir --upgrade pip
 
-# ── 1. Clone P2C ──────────────────────────────────────────────────────────────
-RUN git clone https://github.com/CuiRuikai/Partial2Complete.git /opt/p2c
-
-# ── 2. Build P2C CUDA extensions via setup.py ────────────────────────────────
 # TORCH_CUDA_ARCH_LIST must be set — torch 2.1 _get_cuda_arch_flags crashes
 # with IndexError if the list is empty (no GPU detected at build time).
-# 7.5=Turing, 8.0/8.6=Ampere, 8.9=Ada Lovelace (RTX 4000 Ada)
+# 7.5=Turing, 8.0/8.6=Ampere, 8.9=Ada Lovelace, add 9.0 for Hopper if needed
 ENV TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"
-RUN cd /opt/p2c/extensions/chamfer_dist && python setup.py install
-RUN cd /opt/p2c/extensions/pointops    && python setup.py install
 
-# ── 3. Clone NU-MCC ───────────────────────────────────────────────────────────
-RUN git clone https://github.com/sail-sg/numcc.git /opt/numcc
+# ── P2C: clone (shallow), compile extensions, strip git + build artifacts ─────
+RUN git clone --depth=1 https://github.com/CuiRuikai/Partial2Complete.git /opt/p2c && \
+    cd /opt/p2c/extensions/chamfer_dist && python setup.py install && \
+    cd /opt/p2c/extensions/pointops    && python setup.py install && \
+    rm -rf /opt/p2c/.git \
+           /opt/p2c/extensions/chamfer_dist/build \
+           /opt/p2c/extensions/pointops/build
 
-# ── 4. Python deps ────────────────────────────────────────────────────────────
-COPY models/numcc/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
+# ── NU-MCC: Python only — just strip git history ──────────────────────────────
+RUN git clone --depth=1 https://github.com/sail-sg/numcc.git /opt/numcc && \
+    rm -rf /opt/numcc/.git
 
-# ── 5. pytorch3d — pre-built wheel available for x86 + CUDA 11.8 ─────────────
+# ── Python deps ───────────────────────────────────────────────────────────────
+COPY models/numcc/requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ── pytorch3d — pre-built wheel for x86 + CUDA 11.8 ──────────────────────────
 RUN pip install --no-cache-dir \
     'pytorch3d @ https://dl.fbaipublicfiles.com/pytorch3d/packaging/wheels/py310_cu118_pyt210/pytorch3d-0.7.5-cp310-cp310-linux_x86_64.whl' || \
     pip install --no-cache-dir \
     'pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git' || \
     echo "WARNING: pytorch3d build failed — ManifoldnessConstraint will not work"
 
-# ── 6. nksr — Neural Kernel Surface Reconstruction (build from source) ───────
-# nksr wheel server (nksr.huangjh.tech) was discontinued; build from the repo.
-# setup.py downloads OpenVDB + Eigen at build time and compiles CUDA extensions.
-# --no-build-isolation: uses the installed torch (2.1.0) instead of re-downloading.
-# torch-scatter required by nksr Python code; wheel keyed to torch+cu version.
+# ── nksr — build from submodule, clean up source + pip cache after install ───
+# torch-scatter required by nksr; wheel keyed to torch+cu version.
+# gitpython needed by nksr setup.py to download OpenVDB + Eigen at build time.
+COPY submodules/nksr/package/ /opt/nksr-src/
 RUN pip install --no-cache-dir \
-    torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
-# gitpython needed by nksr setup.py to download OpenVDB + Eigen at build time
-RUN pip install --no-cache-dir gitpython
-COPY submodules/nksr/package/ /opt/nksr/
-RUN pip install --no-cache-dir --no-build-isolation /opt/nksr/ || \
-    echo "WARNING: nksr build failed — noksr method will use BPA fallback"
+        torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu118.html && \
+    pip install --no-cache-dir gitpython && \
+    pip install --no-cache-dir --no-build-isolation /opt/nksr-src/ || \
+        echo "WARNING: nksr build failed — noksr method will use BPA fallback" && \
+    rm -rf /opt/nksr-src /root/.cache/pip /tmp/pip-*
 
-# ── 7. Pipeline modules ───────────────────────────────────────────────────────
-COPY models/numcc/pointcloud_utils.py models/numcc/mesh_utils.py models/numcc/sdf_generator.py models/numcc/pipeline.py models/numcc/remesh.py /app/
+# ══════════════════════════════════════════════════════════════════════════════
+# Stage 2 — runtime: CUDA runtime only, no nvcc/headers/build tools
+# ══════════════════════════════════════════════════════════════════════════════
+FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
 
-# ── 7. Runtime environment ────────────────────────────────────────────────────
+WORKDIR /app
+
+# Runtime shared libs only — no build tools, no -dev headers
+RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 libgomp1 libspatialindex-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Full Python environment from builder — includes all pip packages and compiled
+# CUDA extensions (.egg-link files for chamfer_dist, pointops, nksr .so, etc.)
+COPY --from=builder /opt/conda /opt/conda
+
+# P2C source (on PYTHONPATH — not a package, must be a directory; .git stripped)
+COPY --from=builder /opt/p2c   /opt/p2c
+
+# NU-MCC source (on PYTHONPATH — same rationale; .git stripped)
+COPY --from=builder /opt/numcc /opt/numcc
+
+# Pipeline application modules
+COPY models/numcc/pointcloud_utils.py models/numcc/mesh_utils.py \
+     models/numcc/sdf_generator.py    models/numcc/pipeline.py \
+     models/numcc/remesh.py           /app/
+
 # Weights downloaded once on host: python tools/download_models_numcc.py
 # Mount at runtime: -v ~/models/numcc:/opt/models:ro
 ENV PYTHONPATH=/opt/p2c:/opt/numcc:/app
