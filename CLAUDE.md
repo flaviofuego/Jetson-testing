@@ -69,6 +69,9 @@ tools/
   download_models_numcc.py          # descarga pesos P2C (Google Drive) y NU-MCC (S3)
   download_models_trellis_windows.py # descarga modelos TRELLIS en Windows + scp a Jetson
   ply_to_obj.py             # convierte PLY gaussiano (dvlt) a OBJ mesh
+  mesh_filter.py            # aplica filtros MeshLab a OBJ: smooth normals, depth smooth, clustering decimation
+  smooth_preserve.py        # suaviza mesh eliminando grumos sin perder detalle geométrico (Taubin + Two Steps)
+  apply_mlx.py              # aplica cualquier script .mlx de MeshLab a un mesh
 data/
   images/               # imágenes de entrada
   outputs/              # salidas de SAM2 (viz, máscaras, recortes)
@@ -208,6 +211,19 @@ docker run --rm --gpus all \
 
 **`move_points` es crítico:** después del filtro por UDF threshold, cada punto candidato se refina por descenso de gradiente sobre el campo UDF (`udf_n_iter=3` iteraciones). Sin esto la superficie es muy escasa e irregular.
 
+**NU-MCC es densificador/completador multiview, NO generador 360° monocular:**
+NU-MCC (Multiview Compressive Coding) necesita varias vistas para completar las zonas ocluidas; desde UNA imagen solo densifica y limpia la superficie visible, no alucina la parte trasera. Esto es comportamiento correcto — no es bug. Consecuencia práctica:
+- **Entrada DA3 monocular + objeto cóncavo (ej. taza):** NU-MCC produce cáscara abierta → CoACD genera 200-333 partes → SDF fragmentado. Preferir **TRELLIS o TripoSR** en ese caso.
+- **Entrada RGBD real (Drake/AIRA depth cam):** NU-MCC densifica correctamente (ej. 4480→13054 pts) y agrega grosor volumétrico. Caso de uso ideal.
+- **Entrada DA3 monocular + objeto convexo (ej. lapicero):** funciona bien, pocos partes CoACD (~7-40).
+
+**Debug dump de NU-MCC:**
+```bash
+docker run ... numcc:x86 --depth ... --debug-dump /output/debug
+# Genera en /output/debug/: seen_image.png, seen_xyz_{x,y,z}.png, anchors.png,
+# candidates.png, surface.ply, udf_hist.png, summary.json (pct_completion, n_candidates, etc.)
+```
+
 **Métodos de reconstrucción de mesh (`--mesh-method`):**
 
 | Método | Faces típicas | Descripción |
@@ -230,6 +246,15 @@ nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resulta
 - Pipeline completo (NU-MCC + poisson): ~45–60s
 - Solo remesh desde PLY (nksr): ~15–20s
 - Solo remesh desde PLY (poisson): ~5–10s
+
+**E2E benchmarks reales (RTX 4000 Ada, DA3→SAM2→NU-MCC→Drake):**
+
+| Asset | DA3 | SAM2 | NU-MCC | Drake | VRAM pico | Partes CoACD |
+|-------|-----|------|--------|-------|-----------|--------------|
+| lapicero (convexo) | ~10s / 9GB | ~8s / 8GB | ~55s / 9.4GB | ~1s | 9.4 GB | ~7 (poisson) |
+| taza (cóncavo, DA3) | 9.6s / 9.2GB | 7.6s / 8.1GB | 50.9s / 9.4GB | 0.6s | 9.4 GB | 234 (poisson) / 333 (noksr) |
+
+Taza produce muchas partes CoACD porque DA3 monocular solo reconstruye la superficie visible (cáscara abierta). Para taza desde una imagen usar TRELLIS/TripoSR.
 
 ### Pipeline completo DA3 → SAM2 → numcc → Drake
 
@@ -257,6 +282,7 @@ python3 tools/run_pipeline_da3_numcc_drake.py data/images/objeto.jpg --name obje
 - `numcc_input/depth_full.npy` — depth métrico (metros, clip [0.05, 20])
 - `numcc_input/intrinsics.json` — intrínsecos estimados por DA3
 - `numcc_input/mask.npy` — máscara SAM2 redimensionada a resolución del depth
+- `numcc_input/<stem>_masked.png` — imagen con fondo blanco (se pasa como `--color` a numcc)
 - `vram_profile.csv` — uso de VRAM por stage
 
 ### dvlt — reconstrucción gaussiana
@@ -338,6 +364,55 @@ wsl rsync -av jetson@192.168.1.43:~/Jetson-testing/assets/ /mnt/c/Users/flavi/..
 wsl rsync -av jetson@192.168.1.43:~/dvlt.cu/meshes/ /mnt/c/Users/flavi/.../dvlt.cu/meshes/
 ```
 
+## Post-procesado de mesh (PyMeshLab)
+
+PyMeshLab instalado en el venv del proyecto (`.venv`). Permite aplicar filtros MeshLab por CLI sin abrir la GUI.
+
+```bash
+# Instalar (ya hecho)
+uv pip install pymeshlab
+```
+
+### smooth_preserve.py — suavizado preservando geometría
+
+Secuencia recomendada para eliminar grumos manteniendo bordes y detalle:
+1. Clustering Decimation — reduce faces primero
+2. Taubin Smooth — suaviza sin encoger el mesh (mejor que Laplacian)
+3. Two Steps Smoothing — alisa zonas planas, preserva aristas por ángulo
+4. Smooth Face Normals — limpia normales al final
+
+```bash
+# Uso básico
+.venv/bin/python3 tools/smooth_preserve.py input.obj output.obj
+
+# Ajustar agresividad (más iter = más liso; angle menor = preserva más bordes)
+.venv/bin/python3 tools/smooth_preserve.py input.obj output.obj \
+    --taubin-iter 20 --twosteps-iter 5 --feature-angle 30
+```
+
+### mesh_filter.py — filtros individuales
+
+```bash
+.venv/bin/python3 tools/mesh_filter.py input.obj output.obj \
+    --smooth-normals --smooth-iter 4 \
+    --depth-smooth --depth-smooth-iter 4 \
+    --cluster-decimation --threshold 0.3
+```
+
+### apply_mlx.py — aplicar script exportado desde GUI MeshLab
+
+Exportar desde MeshLab GUI: Filters → Show current filter script → Save Script (.mlx)
+
+```bash
+.venv/bin/python3 tools/apply_mlx.py input.obj output.obj assets/Scripts/mi_script.mlx
+```
+
+**Scripts MLX guardados en `assets/Scripts/`:**
+- `script_smoothing.mlx` — secuencia de smooth normals + clustering decimation + depth smooth aplicada en GUI
+- `script_smooth_preserve.mlx` — clustering + Taubin + Two Steps (recomendado)
+
+**Nota:** assets generados por Docker son de root — hacer `sudo chown -R $USER:$USER assets/` antes de guardar con PyMeshLab.
+
 ## Modelos y caché
 
 Los modelos se guardan en el host y se montan en Docker:
@@ -381,3 +456,4 @@ Los modelos se guardan en el host y se montan en Docker:
 - nksr wheel server (`nksr.huangjh.tech`) está permanentemente caído (NXDOMAIN); el submodulo es la única vía de instalación
 - nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — montar `~/models/nksr_cache:/root/.cache/torch` para no re-descargarlo en cada container
 - El gitignore cubre `/assets/` — ningún asset generado se commitea
+- `run_pipeline_da3_numcc_drake.py` y scripts de tools requieren `.venv/bin/python3` (no `python3` del sistema — no tiene numpy)
