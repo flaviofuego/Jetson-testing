@@ -83,17 +83,29 @@ data/
 
 ## Imágenes Docker
 
-| Tag | Dockerfile | Base | Hardware |
-|-----|-----------|------|----------|
-| `sam2:x86` | `submodules/sam2/Dockerfile.x86` | `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel` | x86 GPU |
-| `sam2:jetson` | `submodules/sam2/Dockerfile.jetson` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
-| `triposr` | `models/triposr/Dockerfile` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
-| `triposr:cpu` | `models/triposr/Dockerfile.cpu` | `python:3.12-slim` | CPU cualquier máquina |
-| `triposr:x86` | `models/triposr/Dockerfile.x86` | `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel` | x86 GPU |
-| `trellis` | `models/trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU |
-| `trellis:x86` | `models/trellis/Dockerfile.x86` | - | x86 GPU |
-| `numcc:x86` | `models/numcc/Dockerfile.x86` | `pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel` | x86 GPU |
-| `dvlt:jetson` | `submodules/dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU |
+| Tag | Dockerfile | Base runtime | Hardware | Tamaño |
+|-----|-----------|--------------|----------|--------|
+| `sam2:x86` | `submodules/sam2/Dockerfile.x86-server` | `pytorch:2.5.1-cuda12.1-cudnn9-runtime` | x86 GPU (CUDA 12.1) | **18.1 GB** |
+| `sam2:x86-cuda128` | `submodules/sam2/Dockerfile.x86` | `pytorch:2.7.0-cuda12.8-cudnn9-runtime` | x86 GPU (CUDA 12.8+) | ~18 GB |
+| `sam2:jetson` | `submodules/sam2/Dockerfile.jetson` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU | — |
+| `triposr` | `models/triposr/Dockerfile` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU | — |
+| `triposr:cpu` | `models/triposr/Dockerfile.cpu` | `python:3.12-slim` | CPU cualquier máquina | — |
+| `triposr:x86` | `models/triposr/Dockerfile.x86` | `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel` | x86 GPU | — |
+| `trellis` | `models/trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU | — |
+| `trellis:x86` | `models/trellis/Dockerfile.x86` | — | x86 GPU | — |
+| `numcc:x86` | `models/numcc/Dockerfile.x86` | `pytorch:2.1.0-cuda11.8-cudnn8-runtime` | x86 GPU | **15.5 GB** |
+| `dvlt:x86` | `submodules/dvlt.cu/Dockerfile.x86` | `nvidia/cuda:12.9.1-base-ubuntu24.04` | x86 GPU | **2 GB** |
+| `dvlt:jetson` | `submodules/dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU | — |
+
+**Todas las imágenes x86 usan multi-stage build** (devel para compilar → runtime para el artifact final). Pesos nunca embebidos — se montan como volumen en runtime.
+
+**Builds x86 (RTX 4000 Ada, desde cero):**
+
+| Imagen | Build time | Reducción vs original |
+|--------|-----------|----------------------|
+| `sam2:x86` | ~5–6 min | 33.1 GB → 18.1 GB (-45%) |
+| `numcc:x86` | ~4–5 min | 31 GB → 15.5 GB (-50%) |
+| `dvlt:x86` | ~1 min | 7.76 GB → 2 GB (-74%) |
 
 ## Comandos principales
 
@@ -116,8 +128,15 @@ python3 tools/generate_asset.py data/images/imagen.png --model sam2 --name objet
 - `{nombre}.png` — objeto principal recortado sobre fondo blanco (listo para TripoSR/TRELLIS)
 - `{nombre}_mask{N}.png` — máscaras individuales (con `--all-masks`)
 
-**Configuración elegida:** `sam2.1_hiera_small` + parámetros default del `SAM2AutomaticMaskGenerator`.
-Tras comparativa tiny/small/base_plus: small detecta objetos enteros sin fragmentarlos, mismo costo de VRAM (~2.4 GB) y tiempo (~2.4s) que los otros modelos.
+**Configuración elegida:** `sam2.1_hiera_small` + `SAM2AutomaticMaskGenerator(points_per_side=8)`.
+Grid 8×8 = 64 prompts en vez de 32×32 = 1024 (default). 16× menos prompts, calidad idéntica para objeto único centrado. Usar `SAM2ImagePredictor` con un solo punto central NO funciona para objetos huecos (taza): el punto cae dentro de la cavidad y SAM2 segmenta el interior, no el objeto completo.
+
+**Benchmarks SAM2 small en taza.jpeg (1156×868, RTX 4000 Ada, `sam2:x86`):**
+
+| Config | Segmentación | Wall clock | VRAM pico | Calidad |
+|--------|-------------|-----------|-----------|---------|
+| AMG 32×32 (1024 pts, default) | 2.95s | 7.35s | 6,980 MB | ✓ |
+| **AMG 8×8 (64 pts, actual)** | **0.84s** | **5.23s** | **5,918 MB** | ✓ idéntica |
 
 **Checkpoints disponibles en `~/models/sam2/`:**
 
@@ -255,8 +274,10 @@ nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resulta
 
 | Asset | DA3 | SAM2 | NU-MCC | Drake | VRAM pico | Partes CoACD |
 |-------|-----|------|--------|-------|-----------|--------------|
-| lapicero (convexo) | ~10s / 9GB | ~8s / 8GB | ~55s / 9.4GB | ~1s | 9.4 GB | ~7 (poisson) |
-| taza (cóncavo, DA3) | 9.6s / 9.2GB | 7.6s / 8.1GB | 50.9s / 9.4GB | 0.6s | 9.4 GB | 234 (poisson) / 333 (noksr) |
+| lapicero (convexo) | ~10s / 9GB | ~5s / 6GB | ~55s / 9.4GB | ~1s | 9.4 GB | ~7 (poisson) |
+| taza (cóncavo, DA3) | 9.6s / 9.2GB | **5.2s / 5.9GB** | 50.9s / 9.4GB | 0.6s | 9.4 GB | 234 (poisson) / 333 (noksr) |
+
+SAM2 mejorado con AMG 8×8 (antes: ~7.6s / 8.1GB VRAM).
 
 Taza produce muchas partes CoACD porque DA3 monocular solo reconstruye la superficie visible (cáscara abierta). Para taza desde una imagen usar TRELLIS/TripoSR.
 
@@ -458,7 +479,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - La IP de la Jetson cambia por DHCP — pendiente configurar IP estática en el router
 - SAM2 extensión CUDA (`sam2._C`) no compiló en la imagen x86 actual — funciona igual, solo sin post-procesado de huecos (no afecta resultados en la mayoría de casos)
 - numcc usa `--gpus all` (x86), no `--runtime=nvidia` (Jetson). El `generate_asset.py` ya lo maneja automáticamente según el modelo
-- numcc Dockerfile usa imagen `-devel` (no `-runtime`) para tener nvcc y compilar extensiones CUDA (chamfer_dist, pointops) en build time; requiere `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"` y `numpy<2`
+- numcc `Dockerfile.x86` es multi-stage: stage devel compila CUDA extensions (chamfer_dist, pointops, nksr) → stage runtime copia `/opt/conda` completo; requiere `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"` y `numpy<2`
 - numcc `pipeline.py` tiene ENTRYPOINT — al correr Docker los argumentos van directo, sin `python3 /app/pipeline.py` delante
 - numcc `remesh.py` requiere `--entrypoint python3` para activarse: `docker run --entrypoint python3 numcc:x86 /app/remesh.py ...`
 - `generate_asset.py` no soporta `--mask` para numcc — usar `tools/run_numcc.py` o Docker directamente
@@ -467,3 +488,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — montar `~/models/nksr_cache:/root/.cache/torch` para no re-descargarlo en cada container
 - El gitignore cubre `/assets/` — ningún asset generado se commitea
 - `pipeline.py` y scripts de tools requieren `.venv/bin/python3` (no `python3` del sistema — no tiene numpy)
+- sam2 `Dockerfile.x86*` son multi-stage: builder (devel) compila `sam2._C.so` → runtime copia `/opt/conda`; los configs YAML no se instalan con `pip install .` (wheel build ignora MANIFEST.in) — se copian explícitamente a `site-packages/sam2/configs/` para que Hydra los encuentre vía `pkg://sam2`
+- dvlt `Dockerfile.x86` usa `nvidia/cuda:base` (solo cudart, ~150 MB) en lugar de `runtime` (cuda-libraries bundle, ~3.5 GB); dvlt solo linka `-lcublasLt` — `libcublas-12-9` se instala explícitamente; no necesita cusparse, curand, ni NCCL
+- dvlt benchmarks reales (RTX 4000 Ada, 6 fotos shoe): wall clock 1.35s, inferencia 488ms, VRAM pico 2,580 MB, 973K puntos PLY
+- SAM2 pesos **no embebidos** en la imagen — se montan en runtime: `-v ~/models/sam2:/opt/sam2/checkpoints:ro`; sin el mount falla con FileNotFoundError en `load_model()`
