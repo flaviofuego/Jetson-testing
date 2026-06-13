@@ -43,7 +43,7 @@ Reconstructs a 3D mesh from a single image using [TripoSR](https://github.com/VA
 
 ### Build
 ```bash
-docker build -t triposr -f triposr/Dockerfile triposr/
+docker build -t triposr -f models/triposr/Dockerfile models/triposr/
 ```
 
 ### Download models (once)
@@ -59,7 +59,7 @@ python3 tools/generate_asset.py data/images/image.png --name mug
 
 ### CPU mode (any machine)
 ```bash
-docker build -t triposr:cpu -f triposr/Dockerfile.cpu triposr/
+docker build -t triposr:cpu -f models/triposr/Dockerfile.cpu models/triposr/
 python3 tools/generate_asset.py data/images/image.png --name mug --cpu
 ```
 
@@ -72,7 +72,7 @@ Build time: ~20–30 min (compiles `spconv` from source for ARM64).
 
 ### Build
 ```bash
-docker build -t trellis -f trellis/Dockerfile trellis/
+docker build -t trellis -f models/trellis/Dockerfile models/trellis/
 ```
 
 ### Download models (once)

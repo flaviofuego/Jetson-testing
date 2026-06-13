@@ -1028,7 +1028,7 @@ sudo chown -R $USER:$USER assets/
 
 #### Análisis del Dockerfile
 
-**Archivo:** `numcc/Dockerfile.x86`
+**Archivo:** `models/numcc/Dockerfile.x86`
 
 | Etapa | Descripción |
 |-------|-------------|
@@ -1046,7 +1046,7 @@ sudo chown -R $USER:$USER assets/
 #### Build
 
 ```bash
-docker build -t numcc:x86 -f numcc/Dockerfile.x86 .
+docker build -t numcc:x86 -f models/numcc/Dockerfile.x86 .
 ```
 
 #### Run (pipeline completo)
@@ -1367,7 +1367,7 @@ python3 tools/download_models_numcc.py
 docker build -t sam2:x86 -f submodules/sam2/Dockerfile.x86 submodules/sam2/
 
 # numcc:x86 (~15 min — compila CUDA extensions)
-docker build -t numcc:x86 -f numcc/Dockerfile.x86 .
+docker build -t numcc:x86 -f models/numcc/Dockerfile.x86 .
 ```
 
 ### 10.7 Verificar instalación
@@ -1793,17 +1793,17 @@ Jetson-testing/
 │   └── nksr/                           # Submódulo nv-tlabs/nksr
 │       └── package/                    # nksr para pip install
 │
-├── numcc/                              # Pipeline NU-MCC
-│   ├── Dockerfile.x86                  # GPU x86 (imagen devel CUDA)
-│   ├── pipeline.py                     # Pipeline completo (ENTRYPOINT Docker)
-│   ├── remesh.py                       # Solo meshing desde PLY
-│   ├── pointcloud_utils.py             # Carga depth, back-projection, Y-up
-│   ├── mesh_utils.py                   # normalize_mesh, decompose_convex (CoACD)
-│   ├── sdf_generator.py                # Generación SDF Drake
-│   └── requirements.txt                # Deps Python del container
-│
-├── triposr/                            # Pipeline TripoSR (alternativa 1 imagen)
-├── trellis/                            # Pipeline TRELLIS (alternativa 1 imagen)
+├── models/
+│   ├── numcc/                          # Pipeline NU-MCC
+│   │   ├── Dockerfile.x86              # GPU x86 (imagen devel CUDA)
+│   │   ├── pipeline.py                 # Pipeline completo (ENTRYPOINT Docker)
+│   │   ├── remesh.py                   # Solo meshing desde PLY
+│   │   ├── pointcloud_utils.py         # Carga depth, back-projection, Y-up
+│   │   ├── mesh_utils.py               # normalize_mesh, decompose_convex (CoACD)
+│   │   ├── sdf_generator.py            # Generación SDF Drake
+│   │   └── requirements.txt            # Deps Python del container
+│   ├── triposr/                        # Pipeline TripoSR (alternativa 1 imagen)
+│   └── trellis/                        # Pipeline TRELLIS (alternativa 1 imagen)
 │
 ├── tools/
 │   ├── run_pipeline_da3_numcc_drake.py # Orquestador completo DA3→numcc→Drake

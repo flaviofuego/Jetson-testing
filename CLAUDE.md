@@ -36,31 +36,32 @@ submodules/
   dvlt.cu/              # submodulo — reconstrucción 3D gaussiana
     run_dvlt.sh         # wrapper para correr dvlt con una carpeta de imágenes
   nksr/                 # submodulo nv-tlabs/nksr — Neural Kernel Surface Reconstruction
-triposr/
-  Dockerfile            # GPU — base dustynv/pytorch:2.6-r36.4.0-cu128
-  Dockerfile.cpu        # CPU — base python:3.12-slim
-  pipeline.py           # preprocess → TripoSR (FP16) → normalize → coacd → SDF
-  image_utils.py
-  mesh_utils.py
-  sdf_generator.py
-  requirements.txt
-  requirements.cpu.txt
-trellis/
-  Dockerfile            # GPU — base dustynv/pytorch:2.7-r36.4.0
-  Dockerfile.x86        # GPU x86
-  pipeline.py           # preprocess → TRELLIS → GLB → OBJ → coacd → SDF
-  image_utils.py
-  mesh_utils.py
-  sdf_generator.py
-  requirements.txt
-numcc/
-  Dockerfile.x86        # GPU x86 — base pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
-  pipeline.py           # depth → P2C → NU-MCC → surface pts → mesh → coacd → SDF
-  remesh.py             # mesh-only desde PLY existente (salta NU-MCC) — corre dentro de Docker
-  pointcloud_utils.py   # back-projection depth → nube de puntos
-  mesh_utils.py
-  sdf_generator.py
-  requirements.txt
+models/
+  triposr/
+    Dockerfile            # GPU — base dustynv/pytorch:2.6-r36.4.0-cu128
+    Dockerfile.cpu        # CPU — base python:3.12-slim
+    pipeline.py           # preprocess → TripoSR (FP16) → normalize → coacd → SDF
+    image_utils.py
+    mesh_utils.py
+    sdf_generator.py
+    requirements.txt
+    requirements.cpu.txt
+  trellis/
+    Dockerfile            # GPU — base dustynv/pytorch:2.7-r36.4.0
+    Dockerfile.x86        # GPU x86
+    pipeline.py           # preprocess → TRELLIS → GLB → OBJ → coacd → SDF
+    image_utils.py
+    mesh_utils.py
+    sdf_generator.py
+    requirements.txt
+  numcc/
+    Dockerfile.x86        # GPU x86 — base pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
+    pipeline.py           # depth → P2C → NU-MCC → surface pts → mesh → coacd → SDF
+    remesh.py             # mesh-only desde PLY existente (salta NU-MCC) — corre dentro de Docker
+    pointcloud_utils.py   # back-projection depth → nube de puntos
+    mesh_utils.py
+    sdf_generator.py
+    requirements.txt
 tools/
   generate_asset.py         # wrapper principal (soporta sam2, triposr, trellis, numcc)
   run_numcc.py              # wrapper numcc: full pipeline o solo remesh, elige nksr/poisson
@@ -84,12 +85,12 @@ data/
 |-----|-----------|------|----------|
 | `sam2:x86` | `submodules/sam2/Dockerfile.x86` | `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel` | x86 GPU |
 | `sam2:jetson` | `submodules/sam2/Dockerfile.jetson` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
-| `triposr` | `triposr/Dockerfile` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
-| `triposr:cpu` | `triposr/Dockerfile.cpu` | `python:3.12-slim` | CPU cualquier máquina |
-| `triposr:x86` | `triposr/Dockerfile.x86` | `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel` | x86 GPU |
-| `trellis` | `trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU |
-| `trellis:x86` | `trellis/Dockerfile.x86` | - | x86 GPU |
-| `numcc:x86` | `numcc/Dockerfile.x86` | `pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel` | x86 GPU |
+| `triposr` | `models/triposr/Dockerfile` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
+| `triposr:cpu` | `models/triposr/Dockerfile.cpu` | `python:3.12-slim` | CPU cualquier máquina |
+| `triposr:x86` | `models/triposr/Dockerfile.x86` | `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel` | x86 GPU |
+| `trellis` | `models/trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU |
+| `trellis:x86` | `models/trellis/Dockerfile.x86` | - | x86 GPU |
+| `numcc:x86` | `models/numcc/Dockerfile.x86` | `pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel` | x86 GPU |
 | `dvlt:jetson` | `submodules/dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU |
 
 ## Comandos principales
@@ -155,7 +156,7 @@ python3 tools/download_models_numcc.py
 # → ~/models/numcc/numcc/numcc_checkpoint.pth  (2.4 GB, S3)
 
 # Construir imagen Docker (una sola vez, ~15 min — compila nksr + P2C CUDA extensions)
-docker build -t numcc:x86 -f numcc/Dockerfile.x86 .
+docker build -t numcc:x86 -f models/numcc/Dockerfile.x86 .
 
 # Pipeline completo desde foto + depth map
 python3 tools/run_numcc.py \
@@ -453,7 +454,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - numcc `pipeline.py` tiene ENTRYPOINT — al correr Docker los argumentos van directo, sin `python3 /app/pipeline.py` delante
 - numcc `remesh.py` requiere `--entrypoint python3` para activarse: `docker run --entrypoint python3 numcc:x86 /app/remesh.py ...`
 - `generate_asset.py` no soporta `--mask` para numcc — usar `tools/run_numcc.py` o Docker directamente
-- nksr submodulo en `submodules/nksr/` (nv-tlabs/nksr) — se compila en Docker build desde `submodules/nksr/package/setup.py` con `--no-build-isolation`; requiere `gitpython` para descargar OpenVDB + Eigen durante el build; tiempo de compilación ~4 min; Docker build ahora usa contexto `.` (raíz del repo): `docker build -t numcc:x86 -f numcc/Dockerfile.x86 .`
+- nksr submodulo en `submodules/nksr/` (nv-tlabs/nksr) — se compila en Docker build desde `submodules/nksr/package/setup.py` con `--no-build-isolation`; requiere `gitpython` para descargar OpenVDB + Eigen durante el build; tiempo de compilación ~4 min; Docker build ahora usa contexto `.` (raíz del repo): `docker build -t numcc:x86 -f models/numcc/Dockerfile.x86 .`
 - nksr wheel server (`nksr.huangjh.tech`) está permanentemente caído (NXDOMAIN); el submodulo es la única vía de instalación
 - nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — montar `~/models/nksr_cache:/root/.cache/torch` para no re-descargarlo en cada container
 - El gitignore cubre `/assets/` — ningún asset generado se commitea
