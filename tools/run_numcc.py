@@ -71,7 +71,7 @@ def run_sam2(image: Path, name: str) -> Path:
         "-v", f"{image.parent}:/input:ro",
         "-v", f"{OUTPUTS_DIR}:/output",
         "-v", f"{SAM2_CKPTS}:/opt/sam2/checkpoints:ro",
-        "-v", f"{PROJECT_ROOT / 'sam2' / 'pipeline.py'}:/opt/sam2/pipeline.py:ro",
+        "-v", f"{PROJECT_ROOT / 'submodules' / 'sam2' / 'pipeline.py'}:/opt/sam2/pipeline.py:ro",
         "--entrypoint", "python3",
         DOCKER_SAM2,
         "/opt/sam2/pipeline.py",

@@ -28,7 +28,7 @@ RUN cd /opt/p2c/extensions/pointops    && python setup.py install
 RUN git clone https://github.com/sail-sg/numcc.git /opt/numcc
 
 # ── 4. Python deps ────────────────────────────────────────────────────────────
-COPY requirements.txt /app/requirements.txt
+COPY numcc/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # ── 5. pytorch3d — pre-built wheel available for x86 + CUDA 11.8 ─────────────
@@ -47,12 +47,12 @@ RUN pip install --no-cache-dir \
     torch-scatter -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
 # gitpython needed by nksr setup.py to download OpenVDB + Eigen at build time
 RUN pip install --no-cache-dir gitpython
-COPY nksr/package/ /opt/nksr/
+COPY submodules/nksr/package/ /opt/nksr/
 RUN pip install --no-cache-dir --no-build-isolation /opt/nksr/ || \
     echo "WARNING: nksr build failed — noksr method will use BPA fallback"
 
 # ── 7. Pipeline modules ───────────────────────────────────────────────────────
-COPY pointcloud_utils.py mesh_utils.py sdf_generator.py pipeline.py remesh.py /app/
+COPY numcc/pointcloud_utils.py numcc/mesh_utils.py numcc/sdf_generator.py numcc/pipeline.py numcc/remesh.py /app/
 
 # ── 7. Runtime environment ────────────────────────────────────────────────────
 # Weights downloaded once on host: python tools/download_models_numcc.py

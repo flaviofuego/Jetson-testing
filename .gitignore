@@ -23,7 +23,7 @@ docs/superpowers/
 /assets/
 
 # Submodule content tracked separately
-/dvlt.cu
+/submodules/dvlt.cu
 
 # External repos (not submodules)
 /aira/

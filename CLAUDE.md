@@ -27,11 +27,15 @@ Seis pipelines para generar assets 3D desde imágenes o datos RGBD, listos para 
 ## Estructura del repo
 
 ```
-sam2/                   # submodulo fork — segmentación (SAM2.1, Meta)
-  Dockerfile.jetson     # GPU ARM64 — base dustynv/pytorch:2.6-r36.4.0-cu128
-  Dockerfile.x86        # GPU x86   — base pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
-  pipeline.py           # segment → recortar objeto → PNG fondo blanco
-depth-anything-3/       # submodulo — estimación de profundidad monocular (DA3, ByteDance 2025)
+submodules/
+  sam2/                 # submodulo fork — segmentación (SAM2.1, Meta)
+    Dockerfile.jetson   # GPU ARM64 — base dustynv/pytorch:2.6-r36.4.0-cu128
+    Dockerfile.x86      # GPU x86   — base pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel
+    pipeline.py         # segment → recortar objeto → PNG fondo blanco
+  depth-anything-3/     # submodulo — estimación de profundidad monocular (DA3, ByteDance 2025)
+  dvlt.cu/              # submodulo — reconstrucción 3D gaussiana
+    run_dvlt.sh         # wrapper para correr dvlt con una carpeta de imágenes
+  nksr/                 # submodulo nv-tlabs/nksr — Neural Kernel Surface Reconstruction
 triposr/
   Dockerfile            # GPU — base dustynv/pytorch:2.6-r36.4.0-cu128
   Dockerfile.cpu        # CPU — base python:3.12-slim
@@ -57,9 +61,6 @@ numcc/
   mesh_utils.py
   sdf_generator.py
   requirements.txt
-  nksr/                 # submodulo nv-tlabs/nksr — Neural Kernel Surface Reconstruction
-dvlt.cu/                # submodulo — reconstrucción 3D gaussiana
-  run_dvlt.sh           # wrapper para correr dvlt con una carpeta de imágenes
 tools/
   generate_asset.py         # wrapper principal (soporta sam2, triposr, trellis, numcc)
   run_numcc.py              # wrapper numcc: full pipeline o solo remesh, elige nksr/poisson
@@ -81,15 +82,15 @@ data/
 
 | Tag | Dockerfile | Base | Hardware |
 |-----|-----------|------|----------|
-| `sam2:x86` | `sam2/Dockerfile.x86` | `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel` | x86 GPU |
-| `sam2:jetson` | `sam2/Dockerfile.jetson` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
+| `sam2:x86` | `submodules/sam2/Dockerfile.x86` | `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel` | x86 GPU |
+| `sam2:jetson` | `submodules/sam2/Dockerfile.jetson` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
 | `triposr` | `triposr/Dockerfile` | `dustynv/pytorch:2.6-r36.4.0-cu128` | Jetson GPU |
 | `triposr:cpu` | `triposr/Dockerfile.cpu` | `python:3.12-slim` | CPU cualquier máquina |
 | `triposr:x86` | `triposr/Dockerfile.x86` | `pytorch/pytorch:2.4.1-cuda12.4-cudnn9-devel` | x86 GPU |
 | `trellis` | `trellis/Dockerfile` | `dustynv/pytorch:2.7-r36.4.0` | Jetson GPU |
 | `trellis:x86` | `trellis/Dockerfile.x86` | - | x86 GPU |
 | `numcc:x86` | `numcc/Dockerfile.x86` | `pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel` | x86 GPU |
-| `dvlt:jetson` | `dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU |
+| `dvlt:jetson` | `submodules/dvlt.cu/Dockerfile.jetson` | L4T | Jetson GPU |
 
 ## Comandos principales
 
@@ -98,7 +99,7 @@ data/
 ```bash
 # x86 (este servidor) — descarga checkpoint la primera vez
 mkdir -p ~/models/sam2
-cd sam2/checkpoints && bash download_ckpts.sh  # o solo tiny/small
+cd submodules/sam2/checkpoints && bash download_ckpts.sh  # o solo tiny/small
 
 # Segmentar (desde Jetson-testing/)
 python3 tools/generate_asset.py data/images/imagen.png --model sam2 --name objeto
@@ -154,7 +155,7 @@ python3 tools/download_models_numcc.py
 # → ~/models/numcc/numcc/numcc_checkpoint.pth  (2.4 GB, S3)
 
 # Construir imagen Docker (una sola vez, ~15 min — compila nksr + P2C CUDA extensions)
-docker build -t numcc:x86 -f numcc/Dockerfile.x86 numcc/
+docker build -t numcc:x86 -f numcc/Dockerfile.x86 .
 
 # Pipeline completo desde foto + depth map
 python3 tools/run_numcc.py \
@@ -293,12 +294,12 @@ docker run --rm --runtime nvidia -v ~/dvlt.cu/model:/dvlt/model dvlt:jetson --se
 
 # Correr con carpeta de imágenes
 cd ~/Jetson-testing
-./dvlt.cu/run_dvlt.sh ~/Jetson-testing/data/images/taza taza
+./submodules/dvlt.cu/run_dvlt.sh ~/Jetson-testing/data/images/taza taza
 ```
 
 ### Depth Anything 3 — depth map + reconstrucción 3D
 
-DA3 está instalado como submódulo en `depth-anything-3/`. El CLI `da3` queda disponible en el venv de UniWhere (`.venv`). El modelo por defecto es `depth-anything/DA3NESTED-GIANT-LARGE-1.1` (~descarga automática desde HF la primera vez).
+DA3 está instalado como submódulo en `submodules/depth-anything-3/`. El CLI `da3` queda disponible en el venv de UniWhere (`.venv`). El modelo por defecto es `depth-anything/DA3NESTED-GIANT-LARGE-1.1` (~descarga automática desde HF la primera vez).
 
 ```bash
 # Activar venv de UniWhere donde está instalado
@@ -341,7 +342,7 @@ da3 image data/images/objeto.jpg \
 - `intrinsics`: `(N, 3, 3)` float32 — matriz K estimada por el modelo
 - `extrinsics`: `(N, 3, 4)` float32 — pose estimada (identidad para imagen única)
 
-**Bugs corregidos en el CLI de DA3** (`depth-anything-3/src/depth_anything_3/cli.py`):
+**Bugs corregidos en el CLI de DA3** (`submodules/depth-anything-3/src/depth_anything_3/cli.py`):
 - `reference_view_strategy` → `ref_view_strategy` en llamadas a `run_inference()` (4 ocurrencias, líneas ~383, 462, 549, 626)
 
 **Depth Anything V2** también disponible via `transformers` sin instalación manual:
@@ -440,7 +441,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - Docker usa `--runtime=nvidia` (no `--gpus all`) en esta Jetson
 - Los assets generados por Docker son propiedad de root — usar `sudo chown -R jetson:jetson ~/Jetson-testing/assets` si hay problemas de permisos
 - El entorno `pyproject.toml` (uv/Drake) es independiente — NO incluye TripoSR ni TRELLIS (conflictos de versiones)
-- `dvlt.cu`, `depth-anything-3`, `sam2` y `numcc/nksr` son submódulos git — clonar con `git clone --recurse-submodules`
+- `submodules/dvlt.cu`, `submodules/depth-anything-3`, `submodules/sam2` y `submodules/nksr` son submódulos git — clonar con `git clone --recurse-submodules`
 - `git config --global submodule.recurse true` para que pull/fetch actualice submódulos automáticamente
 - `sam2` es un fork de `facebookresearch/sam2` en `cristian10gf/sam2`
 - DA3 instalado en el venv de UniWhere (`/home/worker-node-4/Documents/GitHub/UniWhere/.venv`), no tiene venv propio
@@ -452,7 +453,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - numcc `pipeline.py` tiene ENTRYPOINT — al correr Docker los argumentos van directo, sin `python3 /app/pipeline.py` delante
 - numcc `remesh.py` requiere `--entrypoint python3` para activarse: `docker run --entrypoint python3 numcc:x86 /app/remesh.py ...`
 - `generate_asset.py` no soporta `--mask` para numcc — usar `tools/run_numcc.py` o Docker directamente
-- nksr submodulo en `numcc/nksr/` (nv-tlabs/nksr) — se compila en Docker build desde `numcc/nksr/package/setup.py` con `--no-build-isolation`; requiere `gitpython` para descargar OpenVDB + Eigen durante el build; tiempo de compilación ~4 min
+- nksr submodulo en `submodules/nksr/` (nv-tlabs/nksr) — se compila en Docker build desde `submodules/nksr/package/setup.py` con `--no-build-isolation`; requiere `gitpython` para descargar OpenVDB + Eigen durante el build; tiempo de compilación ~4 min; Docker build ahora usa contexto `.` (raíz del repo): `docker build -t numcc:x86 -f numcc/Dockerfile.x86 .`
 - nksr wheel server (`nksr.huangjh.tech`) está permanentemente caído (NXDOMAIN); el submodulo es la única vía de instalación
 - nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — montar `~/models/nksr_cache:/root/.cache/torch` para no re-descargarlo en cada container
 - El gitignore cubre `/assets/` — ningún asset generado se commitea

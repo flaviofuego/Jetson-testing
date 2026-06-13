@@ -1,12 +1,12 @@
 [submodule "dvlt.cu"]
-	path = dvlt.cu
+	path = submodules/dvlt.cu
 	url = https://github.com/flaviofuego/dvlt.cu
 [submodule "sam2"]
-	path = sam2
+	path = submodules/sam2
 	url = https://github.com/cristian10gf/sam2.git
 [submodule "depth-anything-3"]
-	path = depth-anything-3
+	path = submodules/depth-anything-3
 	url = https://github.com/bytedance-seed/depth-anything-3.git
 [submodule "numcc/nksr"]
-	path = numcc/nksr
+	path = submodules/nksr
 	url = https://github.com/nv-tlabs/nksr.git
