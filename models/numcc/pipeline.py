@@ -565,6 +565,11 @@ def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "tr
         buf = max_area ** 0.5 * 0.05
         merged = unary_union([p.buffer(buf) for p in significant]).buffer(-buf * 0.5).buffer(0)
 
+        # Tight polygon for penetration guard: small buffer (0.75% radius) for numeric
+        # tolerance only — does NOT bridge concave gaps like the 5% buf above does.
+        from shapely.geometry import Point as _ShapelyPoint
+        original_for_guard = unary_union(significant).buffer(buf * 0.15).buffer(0)
+
         geoms = list(getattr(merged, "geoms", [merged]))
         cap_verts_list: list = []
         cap_faces_list: list = []
@@ -597,6 +602,24 @@ def _slice_and_cap_at_floor(mesh: "trimesh.Trimesh", z_floor_norm: float) -> "tr
 
         all_verts = np.vstack([mesh_cut.vertices] + cap_verts_list)
         all_cap_faces = np.vstack(cap_faces_list)
+
+        # Penetration guard: remove cap triangles whose centroid falls outside the
+        # original (un-buffered) mesh footprint. The 5%-buffered 'merged' polygon
+        # bridges concave gaps (e.g. headphone arch, space between ear cups), producing
+        # triangles that intersect the mesh walls. The tight 'original_for_guard'
+        # (0.75% buffer) rejects those without affecting genuine cap fill.
+        centroids_2d = all_verts[all_cap_faces].mean(axis=1)[:, :2]
+        guard_mask = np.array(
+            [original_for_guard.contains(_ShapelyPoint(float(c[0]), float(c[1])))
+             for c in centroids_2d]
+        )
+        n_guard_removed = int(np.sum(~guard_mask))
+        if n_guard_removed > 0:
+            print(f"      floor cap: penetration guard removed {n_guard_removed} face(s)")
+            all_cap_faces = all_cap_faces[guard_mask]
+        if len(all_cap_faces) == 0:
+            print(f"      floor cap: all faces removed by guard — returning cut mesh")
+            return mesh_cut
 
         # Ensure cap normals point outward (+Z toward bin)
         for i, f in enumerate(all_cap_faces):
