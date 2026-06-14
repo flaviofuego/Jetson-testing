@@ -128,15 +128,22 @@ python3 tools/generate_asset.py data/images/imagen.png --model sam2 --name objet
 - `{nombre}.png` — objeto principal recortado sobre fondo blanco (listo para TripoSR/TRELLIS)
 - `{nombre}_mask{N}.png` — máscaras individuales (con `--all-masks`)
 
-**Configuración actual:** `sam2.1_hiera_small` + `SAM2AutomaticMaskGenerator()` (default — `points_per_side=32`, 1024 prompts).
+**Configuración actual:** `sam2.1_hiera_small` + `SAM2AutomaticMaskGenerator()` (default — `points_per_side=32`, 1024 prompts, `pred_iou_thresh=0.88`, `stability_score_thresh=0.95`).
 `SAM2ImagePredictor` con un solo punto central NO funciona para objetos huecos (taza): el punto cae dentro de la cavidad y SAM2 segmenta el interior, no el objeto completo.
 `points_per_side=8` (64 prompts) falló en objetos de forma compleja (audífonos): los puntos caen en el fondo visible a través del arco y AMG filtra las masks por bajo IoU → objeto no detectado.
 
-**Benchmarks SAM2 small en taza.jpeg (1156×868, RTX 4000 Ada, `sam2:x86`):**
+**Merge de masks (merge_centered_masks):** seed = mask más centrada no-background (area < 5% frame). Absorbe iterativamente masks dentro de `dilation_px=30` px de distancia Euclidiana (vía `distance_transform_edt`, O(n) vs OOM de `binary_dilation` a radios grandes). `max_area_frac=0.05` excluye paredes/suelo grandes que pasan el 40% original.
+
+**Thresholds AMG y estructuras delgadas:** AMG filtra como "ruido" masks con IoU < 0.88 o stability < 0.95. El arco del cinto de audífonos genera masks de baja confianza → queda fuera con defaults. Con `--pred-iou-thresh 0.70 --stability-score-thresh 0.80` se detecta el arco (41 masks vs 19, area 91K vs 65K px²). Trade-off: más noise en escenas complejas (centro.jpeg con estos thresholds fusiona objetos del fondo). Usar thresholds bajos solo cuando el objeto tiene estructuras delgadas Y la imagen tiene fondo simple.
+
+**Ángulo de imagen crítico para audífonos:** vista cenital (centro.jpeg) el arco del cinto tiene ~20px de ancho — AMG nunca lo detecta. Vista lateral (derecho.jpeg) el arco es claramente visible y grueso → con thresholds bajos se captura. **Usar `headphones_derecho.jpeg` con `--sam2-pred-iou-thresh 0.70 --sam2-stability-thresh 0.80`.**
+
+**Benchmarks SAM2 small (1156×868, RTX 4000 Ada, `sam2:x86`):**
 
 | Config | Segmentación | Wall clock | VRAM pico | Calidad |
 |--------|-------------|-----------|-----------|---------|
-| **AMG 32×32 (1024 pts, actual)** | **2.95s** | **7.35s** | **6,980 MB** | ✓ |
+| **AMG 32×32, iou=0.88, stab=0.95 (default)** | **2.95s** | **7.35s** | **6,980 MB** | ✓ objetos simples |
+| AMG 32×32, iou=0.70, stab=0.80 | 3.95s | ~10s | ~7,000 MB | ✓ audífonos arco visible |
 | AMG 8×8 (64 pts, revertido) | 0.84s | 5.23s | 5,918 MB | ✗ falla shapes complejas |
 
 **Checkpoints disponibles en `~/models/sam2/`:**
@@ -145,7 +152,7 @@ python3 tools/generate_asset.py data/images/imagen.png --model sam2 --name objet
 |--------|--------|------|
 | `sam2.1_hiera_tiny.pt` | 149 MB | más fragmenta |
 | `sam2.1_hiera_small.pt` | 176 MB | **usado en pipeline** |
-| `sam2.1_hiera_base_plus.pt` | 309 MB | más máscaras, requiere tuning |
+| `sam2.1_hiera_base_plus.pt` | 309 MB | seed diferente → peor resultado para audífonos (63K vs 91K px²) |
 
 **En Jetson** usar `--runtime=nvidia` en lugar de `--gpus all` en el comando docker. El `generate_asset.py` usa `--gpus all` (para x86); para Jetson correr `pipeline.py` directamente dentro del container `sam2:jetson`.
 
