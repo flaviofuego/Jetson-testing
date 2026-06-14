@@ -792,18 +792,16 @@ def main():
             stages["SAM2"] = result
             segmask_npy = result["segmask_npy"]
 
-        # ── [3] Prepare ───────────────────────────────────────────────────────
-        prep = stage_prepare(depth_npy, segmask_npy, image, intri_json, dir_prepare)
-
-        # ── [4] numcc ─────────────────────────────────────────────────────────
+        # ── [3+4] Prepare + numcc ─────────────────────────────────────────────
         if args.skip_numcc:
             obj_path = dir_mesh / f"{args.name}.obj"
             if not obj_path.exists():
                 sys.exit(f"--skip-numcc: OBJ no encontrado: {obj_path}")
-            print(f"\n[--skip-numcc] Usando {obj_path}")
+            print(f"\n[--skip-numcc] Saltando prepare + numcc — usando {obj_path}")
             stages["numcc"] = {"t0": 0, "t1": 0, "peak_mb": 0}  # placeholder
 
         else:
+            prep = stage_prepare(depth_npy, segmask_npy, image, intri_json, dir_prepare)
             result = stage_numcc(
                 depth_npy    = prep["depth_npy"],
                 mask_npy     = prep["mask_npy"],
