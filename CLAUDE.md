@@ -9,13 +9,13 @@ Seis pipelines para generar assets 3D desde imágenes o datos RGBD, listos para 
 | SAM2 | SAM2.1 small (Meta) | 1 imagen | objeto recortado PNG (fondo blanco) |
 | TripoSR | TripoSR (Stability AI) | 1 imagen | OBJ + SDF |
 | TRELLIS | TRELLIS-image-large (Microsoft) | 1 imagen | GLB + OBJ + SDF |
-| **numcc** | **P2C + NU-MCC (CO3D-V2)** | **depth map + color (RGBD)** | **OBJ + SDF** |
+| **numcc** | **P2C + NU-MCC (CO3D-V2)** | **depth map + color (RGBD)** | **OBJ + OBJ_smoothed** |
 | dvlt.cu | DVLT (NVIDIA) | 1+ imágenes | PLY gaussiano → OBJ |
 | depth-anything-3 | DA3NESTED-GIANT-LARGE (ByteDance) | 1+ imágenes | depth map + GLB point cloud |
 
 **Flujo típico imagen:** SAM2 → TripoSR o TRELLIS (SAM2 reemplaza a rembg para segmentar el objeto antes de la reconstrucción 3D)
 
-**Flujo RGBD (cámara de profundidad / simulación Drake):** depth + color → numcc (P2C + NU-MCC) → OBJ + SDF
+**Flujo RGBD (cámara de profundidad / simulación Drake):** depth + color → numcc (P2C + NU-MCC) → OBJ → smooth (PyMeshLab) → OBJ_smoothed
 
 ## Hardware / Conexión
 
@@ -56,7 +56,7 @@ models/
     requirements.txt
   numcc/
     Dockerfile.x86        # GPU x86 — base pytorch/pytorch:2.1.0-cuda11.8-cudnn8-devel
-    pipeline.py           # depth → P2C → NU-MCC → surface pts → mesh → coacd → SDF
+    pipeline.py           # depth → P2C → NU-MCC → surface pts → mesh → (coacd → SDF, skip con --no-sdf)
     remesh.py             # mesh-only desde PLY existente (salta NU-MCC) — corre dentro de Docker
     pointcloud_utils.py   # back-projection depth → nube de puntos
     mesh_utils.py
@@ -264,7 +264,11 @@ docker run ... numcc:x86 --depth ... --debug-dump /output/debug
 
 nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resultado tiene mayor resolución geométrica pero CoACD genera más partes convexas. Para Drake, ambos son válidos — usar `poisson` si se necesitan menos partes CoACD.
 
-**Outputs en `assets/<nombre>/`:**
+**`--no-sdf` flag:** pasa `--no-sdf` al container para saltar CoACD + SDF (usado por `tools/pipeline.py` siempre). Sin este flag corre CoACD y genera `.sdf` y `_parts/`.
+
+**Floor cap penetration guard:** `_slice_and_cap_at_floor` genera una tapa Delaunay en el plano de soporte. El `merged` polygon usa buffer del 5% para bridgear gaps del boundary ruidoso, pero en objetos cóncavos (audífonos: arco, espacio entre copas) ese buffer llena concavidades y genera triángulos que cruzan las paredes del mesh. Fix: `original_for_guard = unary_union(significant).buffer(buf * 0.15)` (0.75% — solo tolerancia numérica). Después de apilar `all_cap_faces`, se filtra cualquier cara cuyo centroide caiga fuera de `original_for_guard`. Resultado típico audífonos: ~3500 caras penetrantes removidas, ~400 válidas retención.
+
+**Outputs en `assets/<nombre>/` (run_numcc.py directo, sin --no-sdf):**
 - `<nombre>.obj` — mesh final (método elegido)
 - `<nombre>.sdf` — listo para Drake
 - `<nombre>_numcc_surface.ply` — nube bruta de NU-MCC (espacio normalizado, antes del mesh)
@@ -273,41 +277,39 @@ nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resulta
 - `<nombre>_parts/` — piezas CoACD
 
 **Tiempo típico (RTX 4000 Ada, 20 GB, run_numcc.py directo):**
-- Pipeline completo (NU-MCC + nksr): ~70–100s
-- Pipeline completo (NU-MCC + poisson): ~45–60s
+- Pipeline completo (NU-MCC + nksr): ~18–20s (sin CoACD/SDF) / ~70–100s (con CoACD/SDF)
+- Pipeline completo (NU-MCC + poisson): ~10–15s (sin CoACD/SDF) / ~45–60s (con CoACD/SDF)
 - Solo remesh desde PLY (nksr): ~15–20s
 - Solo remesh desde PLY (poisson): ~5–10s
 
-**Tiempo típico (tools/pipeline.py — DA3+SAM2+numcc+Drake):** 45–60s objetos simples, ~57s audífonos con thresholds bajos.
+**Tiempo típico (tools/pipeline.py — DA3+SAM2+numcc+smooth):** ~35–45s objetos simples, ~20s desde --skip-da3 --skip-sam2.
 
-**E2E benchmarks reales (RTX 4000 Ada, DA3→SAM2→NU-MCC→Drake):**
+**E2E benchmarks reales (RTX 4000 Ada, DA3→SAM2→NU-MCC+nksr→smooth, sin SDF/CoACD):**
 
-| Asset | DA3 | SAM2 | NU-MCC | Drake | Total | VRAM pico | Pts superficie | Partes CoACD |
-|-------|-----|------|--------|-------|-------|-----------|---------------|--------------|
-| lapicero (convexo) | ~10s / 9GB | ~5s / 6GB | ~55s / 9.4GB | ~1s | ~71s | 9.4 GB | — | ~7 (poisson) |
-| taza (cóncavo, DA3) | 9.6s / 9.2GB | 7.5s / 7GB | 50.9s / 9.4GB | 0.6s | ~69s | 9.4 GB | — | 234 (poisson) / 333 (noksr) |
-| headphones (vista cenital, iou=0.88) | 13.6s / 7.2GB | 9.5s / 4.5GB | 20.6s / 7.3GB | 0.8s | 44.7s | 10.7 GB | 13,797 | 32 (noksr) |
-| **headphones (vista lateral, iou=0.70)** | **11.4s / 7.2GB** | **14.1s / 5.3GB** | **30.4s / 7.4GB** | **0.5s** | **56.7s** | **11.7 GB** | **31,592** | **89 (noksr)** |
+| Asset | DA3 | SAM2 | NU-MCC+nksr | smooth | Total | VRAM pico | Pts superficie |
+|-------|-----|------|-------------|--------|-------|-----------|----------------|
+| headphones (vista cenital, iou=0.88) | 13.6s / 7.2GB | 9.5s / 4.5GB | 13.2s / 11.2GB | 0.8s | ~37s | 11.2 GB | 13,797 |
+| **headphones (vista lateral, iou=0.70)** | **11.4s / 7.2GB** | **14.1s / 5.3GB** | **18.3s / 11.2GB** | **2.3s** | **~46s** | **11.2 GB** | **30,627** |
 
-- Taza/cáscara abierta → muchas partes CoACD. Para taza desde imagen única usar TRELLIS/TripoSR.
-- Audífonos vista cenital: arco no capturado (demasiado delgado). Vista lateral + thresholds bajos: arco completo, 2.3× más pts de superficie.
-- Inertia Drake inválida para meshes tipo cáscara (momentos negativos) — loads OK, física no válida.
+- Guard removió ~3500 caras penetrantes en audífonos derecho → 428 válidas en cap.
+- Audífonos vista cenital: arco no capturado. Vista lateral + thresholds bajos: arco completo.
+- Sin SDF/CoACD el pipeline es 3–5× más rápido en el stage numcc.
 
-### Pipeline completo DA3 → SAM2 → numcc → Drake
+### Pipeline completo DA3 → SAM2 → numcc → smooth
 
-Script unificado `tools/pipeline.py` — encadena todos los stages con output organizado por subdirectorios y monitoreo de VRAM:
+Script unificado `tools/pipeline.py` — encadena todos los stages con output organizado por subdirectorios y monitoreo de VRAM. **SDF y Drake eliminados del pipeline**; smoothing es stage obligatoria post-numcc.
 
 ```bash
 # Pipeline completo (primera vez — corre todo)
 .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto
 
-# Saltar stages ya calculados
+# Desde numcc en adelante (salta DA3 y SAM2, recalcula mesh + smooth)
 .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
-    --skip-da3 --skip-sam2
+    --skip-da3 --skip-sam2 --no-p2c
 
-# Con visualización interactiva en Meshcat (bloquea hasta Ctrl+C)
+# Solo smooth sobre mesh existente (salta todo hasta smooth)
 .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
-    --drake-interactive
+    --skip-da3 --skip-sam2 --skip-numcc
 
 # Con UDF threshold relajado (recomendado para objetos pequeños/monoculares)
 .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
@@ -318,7 +320,6 @@ Script unificado `tools/pipeline.py` — encadena todos los stages con output or
     --depth path/to/depth.npy --mask path/to/mask.npy --skip-da3 --skip-sam2
 
 # Objeto con estructuras delgadas (arcos, asas, manijas) — bajar thresholds AMG
-# Requiere imagen desde ángulo donde la estructura sea claramente visible y gruesa
 .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --sam2-pred-iou-thresh 0.70 --sam2-stability-thresh 0.80
 
@@ -327,12 +328,14 @@ Script unificado `tools/pipeline.py` — encadena todos los stages con output or
     --sam2-model base_plus
 ```
 
+**`--skip-numcc` salta también `stage_prepare`** — va directo al smooth sin tocar ningún archivo de depth/mask ni lanzar Docker.
+
 **Outputs en `output/<nombre>/`:**
 - `01_da3/` — NPZ + depth_full.npy + intrinsics.json + depth_vis.png
 - `02_sam2/` — segmask.npy + imagen fondo blanco + viz.png
 - `03_numcc_inputs/` — depth_full.npy + mask.npy + intrinsics.json + *_masked.png
 - `04_pointcloud/` — *_object_cloud.ply + *_numcc_surface.ply
-- `05_mesh/` — <nombre>.obj + <nombre>.sdf + <nombre>_parts/
+- `05_mesh/` — <nombre>.obj + <nombre>_smoothed.obj
 - `06_debug/` — (solo con `--debug`) dump NU-MCC inputs/outputs
 - `pipeline_report.json` — tiempos, VRAM pico, parámetros, inventario de archivos
 - `vram_profile.csv` — uso de VRAM por stage
@@ -500,7 +503,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - La IP de la Jetson cambia por DHCP — pendiente configurar IP estática en el router
 - SAM2 extensión CUDA (`sam2._C`) no compiló en la imagen x86 actual — funciona igual, solo sin post-procesado de huecos (no afecta resultados en la mayoría de casos)
 - numcc usa `--gpus all` (x86), no `--runtime=nvidia` (Jetson). El `generate_asset.py` ya lo maneja automáticamente según el modelo
-- `tools/pipeline.py` corre Docker numcc con `--user $(uid):$(gid)` para evitar archivos root-owned en el output; usa `tempfile.mkdtemp` por run para el directorio temporal (evita colisiones con runs anteriores de root)
+- `tools/pipeline.py` corre Docker numcc con `--user $(uid):$(gid)` para evitar archivos root-owned en el output; usa `tempfile.mkdtemp` por run para el directorio temporal (evita colisiones con runs anteriores de root); pasa siempre `--no-sdf` (SDF/CoACD eliminados del pipeline); stage Drake eliminada; smoothing (PyMeshLab) es stage obligatoria post-numcc → `<nombre>_smoothed.obj` en `05_mesh/`; `--skip-numcc` también salta `stage_prepare` (va directo al smooth)
 - numcc `Dockerfile.x86` es multi-stage: stage devel compila CUDA extensions (chamfer_dist, pointops, nksr) → stage runtime copia `/opt/conda` completo; requiere `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"` y `numpy<2`
 - numcc `pipeline.py` tiene ENTRYPOINT — al correr Docker los argumentos van directo, sin `python3 /app/pipeline.py` delante
 - numcc `remesh.py` requiere `--entrypoint python3` para activarse: `docker run --entrypoint python3 numcc:x86 /app/remesh.py ...`
