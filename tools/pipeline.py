@@ -14,12 +14,12 @@ ESTRUCTURA DE SALIDA
   ├── 02_sam2/                 segmask.npy + imagen fondo blanco + viz.png
   ├── 03_numcc_inputs/         depth_full.npy + mask.npy + intrinsics.json + *_masked.png
   ├── 04_pointcloud/           *_object_cloud.ply + *_numcc_surface.ply
-  ├── 05_mesh/                 <name>.obj + <name>.sdf + <name>_parts/
+  ├── 05_mesh/                 <name>.obj + <name>_smoothed.obj
   ├── 06_debug/                (sólo con --debug) dump NU-MCC inputs/outputs
   └── pipeline_report.json     tiempos, VRAM, parámetros, inventario de archivos
 
 USOS
-  # Desde imagen (DA3 → SAM2 → numcc → Drake)
+  # Desde imagen (DA3 → SAM2 → numcc → smooth)
   .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto
 
   # Proveer depth (salta DA3)
@@ -40,9 +40,8 @@ USOS
   .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \\
       --skip-da3 --skip-sam2
 
-  # Con debug dump NU-MCC + visualización Drake
-  .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \\
-      --debug --drake-interactive
+  # Con debug dump NU-MCC
+  .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto --debug
 """
 
 import argparse
@@ -376,6 +375,7 @@ def stage_numcc(
     poisson_depth: int = 10,
     no_p2c: bool = True,
     no_floor_cap: bool = False,
+    no_sdf: bool = True,
 ) -> dict:
     """
     Runs numcc Docker container.
@@ -434,6 +434,8 @@ def stage_numcc(
         cmd.append("--no-p2c")
     if no_floor_cap:
         cmd.append("--no-floor-cap")
+    if no_sdf:
+        cmd.append("--no-sdf")
     if debug_dir is not None:
         debug_dir.mkdir(parents=True, exist_ok=True)
         cmd += ["--debug-dump", "/output/_debug"]
@@ -490,85 +492,56 @@ def stage_numcc(
 
     shutil.rmtree(str(tmp_root), ignore_errors=True)
 
-    if sdf_path is None or not sdf_path.exists():
+    if obj_path is None or not obj_path.exists():
+        raise RuntimeError(f"OBJ not generated. Expected: {mesh_dir}/{name}.obj")
+    if not no_sdf and (sdf_path is None or not sdf_path.exists()):
         raise RuntimeError(f"SDF not generated. Expected: {mesh_dir}/{name}.sdf")
 
     peak = monitor.peak_mb(t0, t1)
     print(f"\n  OBJ: {obj_path}")
-    print(f"  SDF: {sdf_path}")
+    if sdf_path and sdf_path.exists():
+        print(f"  SDF: {sdf_path}")
     print(f"  Time: {t1-t0:.1f}s  |  Peak VRAM: {peak} MB")
 
     return {
-        "sdf_path":  sdf_path,
         "obj_path":  obj_path,
+        "sdf_path":  sdf_path,
         "clouds":    moved_clouds,
         "t0": t0, "t1": t1, "peak_mb": peak,
     }
 
 
-# ─── Stage 5: Drake ───────────────────────────────────────────────────────────
+# ─── Stage 5: Smooth ──────────────────────────────────────────────────────────
 
-_DRAKE_VALIDATE = """\
-import sys
-from pydrake.all import AddMultibodyPlantSceneGraph, DiagramBuilder, Parser
-builder = DiagramBuilder()
-plant, _ = AddMultibodyPlantSceneGraph(builder, time_step=0.001)
-Parser(plant).AddModels(sys.argv[1])
-plant.Finalize()
-print(f"  Drake SDF OK: {sys.argv[1]}")
-print(f"  Bodies: {plant.num_bodies()}  Frames: {plant.num_frames()}")
-"""
+def stage_smooth(obj_path: Path, mesh_dir: Path, name: str, monitor: VRAMMonitor) -> dict:
+    """
+    Runs smooth_preserve.py on the numcc OBJ.
+    Accepts any PyMeshLab-supported format (OBJ, PLY, STL) — detected by extension.
+    Output: <mesh_dir>/<name>_smoothed.obj
+    """
+    header("STAGE 5 — Smoothing  (Clustering → Taubin → Two Steps → Normal Smooth)")
 
-_DRAKE_MESHCAT = """\
-import sys, time
-from pydrake.all import (
-    AddMultibodyPlantSceneGraph, DiagramBuilder,
-    MeshcatVisualizer, Parser, Simulator, StartMeshcat,
-)
-sdf = sys.argv[1]
-print(f"Loading SDF: {sdf}")
-meshcat = StartMeshcat()
-builder = DiagramBuilder()
-plant, scene_graph = AddMultibodyPlantSceneGraph(builder, time_step=0.001)
-Parser(plant).AddModels(sdf)
-plant.Finalize()
-MeshcatVisualizer.AddToBuilder(builder, scene_graph, meshcat)
-diagram = builder.Build()
-sim = Simulator(diagram)
-sim.Initialize()
-sim.AdvanceTo(0.01)
-print(f"\\n  Meshcat: {meshcat.web_url()}")
-print("  Ctrl+C para salir.")
-try:
-    while True: time.sleep(1)
-except KeyboardInterrupt:
-    pass
-"""
+    smooth_script = PROJECT_ROOT / "tools" / "smooth_preserve.py"
+    out_obj = mesh_dir / f"{name}_smoothed.obj"
 
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python3"
+    if not venv_python.exists():
+        sys.exit(f"Venv python not found: {venv_python}")
 
-def stage_drake(
-    sdf_path: Path,
-    monitor: VRAMMonitor,
-    interactive: bool = False,
-) -> dict:
-    header("STAGE 5 — Drake  " + ("(Meshcat)" if interactive else "(validación SDF)"))
-
-    import tempfile
-    script_code = _DRAKE_MESHCAT if interactive else _DRAKE_VALIDATE
-    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False, dir="/tmp") as f:
-        f.write(script_code)
-        script = Path(f.name)
+    cmd = [str(venv_python), str(smooth_script), str(obj_path), str(out_obj)]
 
     t0 = time.time()
-    try:
-        run(["uv", "run", "python3", str(script), str(sdf_path)],)
-    finally:
-        script.unlink(missing_ok=True)
+    run(cmd)
     t1 = time.time()
 
+    if not out_obj.exists():
+        raise RuntimeError(f"Smoothing did not produce {out_obj}")
+
     peak = monitor.peak_mb(t0, t1)
-    print(f"\n  Time: {t1-t0:.1f}s  |  Peak VRAM: {peak} MB")
-    return {"t0": t0, "t1": t1, "peak_mb": peak}
+    print(f"\n  Smoothed OBJ: {out_obj}")
+    print(f"  Time: {t1-t0:.1f}s  |  Peak VRAM: {peak} MB")
+
+    return {"smoothed_obj": out_obj, "t0": t0, "t1": t1, "peak_mb": peak}
 
 
 # ─── Report ───────────────────────────────────────────────────────────────────
@@ -625,6 +598,7 @@ def build_report(
             "poisson_depth": args.poisson_depth,
             "no_p2c":        args.no_p2c,
             "no_floor_cap":  args.no_floor_cap,
+            "skip_smooth":   args.skip_smooth,
             "debug":         args.debug,
         },
         "vram": {
@@ -696,8 +670,8 @@ def main():
                     help="Saltar SAM2 (requiere --mask ó que 02_sam2/<name>_segmask.npy exista)")
     ap.add_argument("--skip-numcc",  action="store_true",
                     help="Saltar numcc (reutiliza mesh en 05_mesh/)")
-    ap.add_argument("--skip-drake",  action="store_true",
-                    help="Saltar validación Drake")
+    ap.add_argument("--skip-smooth", action="store_true",
+                    help="Saltar smoothing (PyMeshLab)")
 
     # ── numcc params ──────────────────────────────────────────────────────────
     ap.add_argument("--mesh-method",    default="noksr",
@@ -727,8 +701,6 @@ def main():
                     help="SAM2 AMG stability threshold (default 0.95; 0.80 para estructuras delgadas)")
 
     # ── extras ────────────────────────────────────────────────────────────────
-    ap.add_argument("--drake-interactive", action="store_true",
-                    help="Abrir Meshcat en Drake (bloquea hasta Ctrl+C)")
     ap.add_argument("--debug",          action="store_true",
                     help="Guardar dump de NU-MCC (seen_xyz, anchors, UDF hist, etc.) "
                          "en 06_debug/")
@@ -825,10 +797,10 @@ def main():
 
         # ── [4] numcc ─────────────────────────────────────────────────────────
         if args.skip_numcc:
-            sdf_path = dir_mesh / f"{args.name}.sdf"
-            if not sdf_path.exists():
-                sys.exit(f"--skip-numcc: SDF no encontrado: {sdf_path}")
-            print(f"\n[--skip-numcc] Usando {sdf_path}")
+            obj_path = dir_mesh / f"{args.name}.obj"
+            if not obj_path.exists():
+                sys.exit(f"--skip-numcc: OBJ no encontrado: {obj_path}")
+            print(f"\n[--skip-numcc] Usando {obj_path}")
             stages["numcc"] = {"t0": 0, "t1": 0, "peak_mb": 0}  # placeholder
 
         else:
@@ -849,14 +821,15 @@ def main():
                 poisson_depth= args.poisson_depth,
                 no_p2c       = args.no_p2c,
                 no_floor_cap = args.no_floor_cap,
+                no_sdf       = True,
             )
             stages["numcc"] = result
-            sdf_path = result["sdf_path"]
+            obj_path = result["obj_path"]
 
-        # ── [5] Drake ─────────────────────────────────────────────────────────
-        if not args.skip_drake:
-            result = stage_drake(sdf_path, monitor, interactive=args.drake_interactive)
-            stages["Drake"] = result
+        # ── [5] Smooth ────────────────────────────────────────────────────────
+        if not args.skip_smooth:
+            result = stage_smooth(obj_path, dir_mesh, args.name, monitor)
+            stages["smooth"] = result
 
     except subprocess.CalledProcessError as e:
         print(f"\n\nPipeline falló (exit code {e.returncode})", file=sys.stderr)

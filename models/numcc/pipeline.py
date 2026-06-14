@@ -885,6 +885,8 @@ def main():
                              "noksr (nksr Neural Kernel Surface Reconstruction), "
                              "both (run both and save {name}_poisson.obj + {name}_noksr.obj "
                              "for quality comparison; {name}.obj uses noksr)")
+    parser.add_argument("--no-sdf", action="store_true",
+                        help="Skip CoACD convex decomposition and SDF generation.")
     parser.add_argument("--no-floor-cap", action="store_true",
                         help="Disable the automatic floor cap. By default, when a mask is "
                              "provided the mesh is cut at the support plane (1st pct of "
@@ -1095,35 +1097,39 @@ def main():
             m_norm.export(str(cmp_path))
             print(f"      Saved comparison: {cmp_path}  ({len(m_norm.faces)} faces)")
 
-    print("[5b/6] Convex decomposition...")
-    try:
-        parts = decompose_convex(mesh, parts_dir, args.name)
-    except Exception as e:
-        print(f"       coacd failed ({e}), falling back to convex hull")
-        import trimesh
-        hull = trimesh.convex.convex_hull(mesh)
-        parts_dir.mkdir(parents=True, exist_ok=True)
-        fallback = parts_dir / "convex_piece_000.obj"
-        hull.export(str(fallback))
-        parts = [fallback]
-    print(f"      {len(parts)} convex part(s)")
+    if not args.no_sdf:
+        print("[5b/6] Convex decomposition...")
+        try:
+            parts = decompose_convex(mesh, parts_dir, args.name)
+        except Exception as e:
+            print(f"       coacd failed ({e}), falling back to convex hull")
+            import trimesh
+            hull = trimesh.convex.convex_hull(mesh)
+            parts_dir.mkdir(parents=True, exist_ok=True)
+            fallback = parts_dir / "convex_piece_000.obj"
+            hull.export(str(fallback))
+            parts = [fallback]
+        print(f"      {len(parts)} convex part(s)")
 
-    print("[6/6] Generating SDF...")
-    relative_parts = [Path(f"{args.name}_parts") / p.name for p in parts]
-    sdf_path = asset_dir / f"{args.name}.sdf"
-    sdf_path.write_text(generate_sdf(args.name, mesh, relative_parts))
-    print(f"      Saved: {sdf_path}")
+        print("[6/6] Generating SDF...")
+        relative_parts = [Path(f"{args.name}_parts") / p.name for p in parts]
+        sdf_path = asset_dir / f"{args.name}.sdf"
+        sdf_path.write_text(generate_sdf(args.name, mesh, relative_parts))
+        print(f"      Saved: {sdf_path}")
+    else:
+        print("[5b/6] Skipping CoACD + SDF (--no-sdf)")
 
     print(f"\nDone -> {asset_dir}/  ({time.time() - t_start:.1f}s total)")
     print(f"  {args.name}.obj  [{method_label}]")
     if args.mesh_method == "both":
         print(f"  {args.name}_poisson.obj")
         print(f"  {args.name}_noksr.obj")
-    print(f"  {args.name}.sdf")
+    if not args.no_sdf:
+        print(f"  {args.name}.sdf")
+        print(f"  {args.name}_parts/")
     print(f"  {args.name}_numcc_surface.ply  ← raw NU-MCC output (normalized space)")
     print(f"  {args.name}_object_cloud.ply   ← depth back-projection (metric space)")
     print(f"  {args.name}_pointcloud.npy")
-    print(f"  {args.name}_parts/")
 
 
 if __name__ == "__main__":
