@@ -236,7 +236,8 @@ def stage_da3(image: Path, out_dir: Path, monitor: VRAMMonitor) -> dict:
 
 # ─── Stage 2: SAM2 ────────────────────────────────────────────────────────────
 
-def stage_sam2(image: Path, name: str, out_dir: Path, monitor: VRAMMonitor) -> dict:
+def stage_sam2(image: Path, name: str, out_dir: Path, monitor: VRAMMonitor,
+               sam2_model: str = "small") -> dict:
     """
     Runs SAM2 on image → out_dir (02_sam2/).
     Returns dict with segmask_npy, color_png, t0, t1.
@@ -256,6 +257,7 @@ def stage_sam2(image: Path, name: str, out_dir: Path, monitor: VRAMMonitor) -> d
         "--input",  f"/input/{image.name}",
         "--output", "/output",
         "--name",   name,
+        "--model",  sam2_model,
     ]
 
     t0 = time.time()
@@ -711,6 +713,11 @@ def main():
     ap.add_argument("--no-floor-cap",   action="store_true",
                     help="Desactivar tapa del plano de soporte")
 
+    # ── sam2 params ───────────────────────────────────────────────────────────
+    ap.add_argument("--sam2-model", default="small",
+                    choices=["tiny", "small", "base_plus"],
+                    help="Variante de modelo SAM2 (default: small)")
+
     # ── extras ────────────────────────────────────────────────────────────────
     ap.add_argument("--drake-interactive", action="store_true",
                     help="Abrir Meshcat en Drake (bloquea hasta Ctrl+C)")
@@ -798,7 +805,7 @@ def main():
             print(f"\n[--skip-sam2] Usando {segmask_npy}")
 
         else:
-            result = stage_sam2(image, args.name, dir_sam2, monitor)
+            result = stage_sam2(image, args.name, dir_sam2, monitor, sam2_model=args.sam2_model)
             stages["SAM2"] = result
             segmask_npy = result["segmask_npy"]
 
