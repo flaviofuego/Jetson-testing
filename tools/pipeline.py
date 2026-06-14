@@ -578,9 +578,10 @@ def build_report(
         }
 
     total_s = None
-    if stages:
-        t_all_start = min(v["t0"] for v in stages.values())
-        t_all_end   = max(v["t1"] for v in stages.values())
+    real = {k: v for k, v in stages.items() if v["t0"] > 0 or v["t1"] > 0}
+    if real:
+        t_all_start = min(v["t0"] for v in real.values())
+        t_all_end   = max(v["t1"] for v in real.values())
         total_s = round(t_all_end - t_all_start, 2)
 
     report = {
