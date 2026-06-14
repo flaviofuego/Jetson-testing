@@ -128,15 +128,16 @@ python3 tools/generate_asset.py data/images/imagen.png --model sam2 --name objet
 - `{nombre}.png` — objeto principal recortado sobre fondo blanco (listo para TripoSR/TRELLIS)
 - `{nombre}_mask{N}.png` — máscaras individuales (con `--all-masks`)
 
-**Configuración elegida:** `sam2.1_hiera_small` + `SAM2AutomaticMaskGenerator(points_per_side=8)`.
-Grid 8×8 = 64 prompts en vez de 32×32 = 1024 (default). 16× menos prompts, calidad idéntica para objeto único centrado. Usar `SAM2ImagePredictor` con un solo punto central NO funciona para objetos huecos (taza): el punto cae dentro de la cavidad y SAM2 segmenta el interior, no el objeto completo.
+**Configuración actual:** `sam2.1_hiera_small` + `SAM2AutomaticMaskGenerator()` (default — `points_per_side=32`, 1024 prompts).
+`SAM2ImagePredictor` con un solo punto central NO funciona para objetos huecos (taza): el punto cae dentro de la cavidad y SAM2 segmenta el interior, no el objeto completo.
+`points_per_side=8` (64 prompts) falló en objetos de forma compleja (audífonos): los puntos caen en el fondo visible a través del arco y AMG filtra las masks por bajo IoU → objeto no detectado.
 
 **Benchmarks SAM2 small en taza.jpeg (1156×868, RTX 4000 Ada, `sam2:x86`):**
 
 | Config | Segmentación | Wall clock | VRAM pico | Calidad |
 |--------|-------------|-----------|-----------|---------|
-| AMG 32×32 (1024 pts, default) | 2.95s | 7.35s | 6,980 MB | ✓ |
-| **AMG 8×8 (64 pts, actual)** | **0.84s** | **5.23s** | **5,918 MB** | ✓ idéntica |
+| **AMG 32×32 (1024 pts, actual)** | **2.95s** | **7.35s** | **6,980 MB** | ✓ |
+| AMG 8×8 (64 pts, revertido) | 0.84s | 5.23s | 5,918 MB | ✗ falla shapes complejas |
 
 **Checkpoints disponibles en `~/models/sam2/`:**
 
@@ -275,9 +276,7 @@ nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resulta
 | Asset | DA3 | SAM2 | NU-MCC | Drake | VRAM pico | Partes CoACD |
 |-------|-----|------|--------|-------|-----------|--------------|
 | lapicero (convexo) | ~10s / 9GB | ~5s / 6GB | ~55s / 9.4GB | ~1s | 9.4 GB | ~7 (poisson) |
-| taza (cóncavo, DA3) | 9.6s / 9.2GB | **5.2s / 5.9GB** | 50.9s / 9.4GB | 0.6s | 9.4 GB | 234 (poisson) / 333 (noksr) |
-
-SAM2 mejorado con AMG 8×8 (antes: ~7.6s / 8.1GB VRAM).
+| taza (cóncavo, DA3) | 9.6s / 9.2GB | ~7.5s / 7GB | 50.9s / 9.4GB | 0.6s | 9.4 GB | 234 (poisson) / 333 (noksr) |
 
 Taza produce muchas partes CoACD porque DA3 monocular solo reconstruye la superficie visible (cáscara abierta). Para taza desde una imagen usar TRELLIS/TripoSR.
 
