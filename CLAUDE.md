@@ -272,20 +272,26 @@ nksr descarga un checkpoint (~55 MB de HuggingFace) en el primer uso. El resulta
 - `<nombre>_pointcloud.npy` — nube de puntos P2C completada
 - `<nombre>_parts/` — piezas CoACD
 
-**Tiempo típico (RTX 4000 Ada, 20 GB):**
+**Tiempo típico (RTX 4000 Ada, 20 GB, run_numcc.py directo):**
 - Pipeline completo (NU-MCC + nksr): ~70–100s
 - Pipeline completo (NU-MCC + poisson): ~45–60s
 - Solo remesh desde PLY (nksr): ~15–20s
 - Solo remesh desde PLY (poisson): ~5–10s
 
+**Tiempo típico (tools/pipeline.py — DA3+SAM2+numcc+Drake):** 45–60s objetos simples, ~57s audífonos con thresholds bajos.
+
 **E2E benchmarks reales (RTX 4000 Ada, DA3→SAM2→NU-MCC→Drake):**
 
-| Asset | DA3 | SAM2 | NU-MCC | Drake | VRAM pico | Partes CoACD |
-|-------|-----|------|--------|-------|-----------|--------------|
-| lapicero (convexo) | ~10s / 9GB | ~5s / 6GB | ~55s / 9.4GB | ~1s | 9.4 GB | ~7 (poisson) |
-| taza (cóncavo, DA3) | 9.6s / 9.2GB | ~7.5s / 7GB | 50.9s / 9.4GB | 0.6s | 9.4 GB | 234 (poisson) / 333 (noksr) |
+| Asset | DA3 | SAM2 | NU-MCC | Drake | Total | VRAM pico | Pts superficie | Partes CoACD |
+|-------|-----|------|--------|-------|-------|-----------|---------------|--------------|
+| lapicero (convexo) | ~10s / 9GB | ~5s / 6GB | ~55s / 9.4GB | ~1s | ~71s | 9.4 GB | — | ~7 (poisson) |
+| taza (cóncavo, DA3) | 9.6s / 9.2GB | 7.5s / 7GB | 50.9s / 9.4GB | 0.6s | ~69s | 9.4 GB | — | 234 (poisson) / 333 (noksr) |
+| headphones (vista cenital, iou=0.88) | 13.6s / 7.2GB | 9.5s / 4.5GB | 20.6s / 7.3GB | 0.8s | 44.7s | 10.7 GB | 13,797 | 32 (noksr) |
+| **headphones (vista lateral, iou=0.70)** | **11.4s / 7.2GB** | **14.1s / 5.3GB** | **30.4s / 7.4GB** | **0.5s** | **56.7s** | **11.7 GB** | **31,592** | **89 (noksr)** |
 
-Taza produce muchas partes CoACD porque DA3 monocular solo reconstruye la superficie visible (cáscara abierta). Para taza desde una imagen usar TRELLIS/TripoSR.
+- Taza/cáscara abierta → muchas partes CoACD. Para taza desde imagen única usar TRELLIS/TripoSR.
+- Audífonos vista cenital: arco no capturado (demasiado delgado). Vista lateral + thresholds bajos: arco completo, 2.3× más pts de superficie.
+- Inertia Drake inválida para meshes tipo cáscara (momentos negativos) — loads OK, física no válida.
 
 ### Pipeline completo DA3 → SAM2 → numcc → Drake
 
@@ -310,6 +316,15 @@ Script unificado `tools/pipeline.py` — encadena todos los stages con output or
 # Desde depth map ya calculado (salta DA3 y SAM2)
 .venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
     --depth path/to/depth.npy --mask path/to/mask.npy --skip-da3 --skip-sam2
+
+# Objeto con estructuras delgadas (arcos, asas, manijas) — bajar thresholds AMG
+# Requiere imagen desde ángulo donde la estructura sea claramente visible y gruesa
+.venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
+    --sam2-pred-iou-thresh 0.70 --sam2-stability-thresh 0.80
+
+# Cambiar variante SAM2 (tiny/small/base_plus)
+.venv/bin/python3 tools/pipeline.py data/images/objeto.jpg --name objeto \
+    --sam2-model base_plus
 ```
 
 **Outputs en `output/<nombre>/`:**
