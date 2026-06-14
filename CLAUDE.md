@@ -474,18 +474,19 @@ Los modelos se guardan en el host y se montan en Docker:
 - `submodules/dvlt.cu`, `submodules/depth-anything-3`, `submodules/sam2` y `submodules/nksr` son submódulos git — clonar con `git clone --recurse-submodules`
 - `git config --global submodule.recurse true` para que pull/fetch actualice submódulos automáticamente
 - `sam2` es un fork de `facebookresearch/sam2` en `cristian10gf/sam2`
-- DA3 instalado en el venv de UniWhere (`/home/worker-node-4/Documents/GitHub/UniWhere/.venv`), no tiene venv propio
+- DA3 instalado en el venv de UniWhere (`/home/worker-node-4/Documents/GitHub/UniWhere/.venv`), no tiene venv propio; el editable install (`.pth`) apuntaba a `depth-anything-3/src` (ruta vieja) — se resolvió con symlink: `ln -s submodules/depth-anything-3 depth-anything-3` en la raíz del repo
 - xformers instalado pero sin extensiones CUDA (torch 2.12 vs xformers compilado para 2.10) — funciona igual, solo sin memory-efficient attention
 - La IP de la Jetson cambia por DHCP — pendiente configurar IP estática en el router
 - SAM2 extensión CUDA (`sam2._C`) no compiló en la imagen x86 actual — funciona igual, solo sin post-procesado de huecos (no afecta resultados en la mayoría de casos)
 - numcc usa `--gpus all` (x86), no `--runtime=nvidia` (Jetson). El `generate_asset.py` ya lo maneja automáticamente según el modelo
+- `tools/pipeline.py` corre Docker numcc con `--user $(uid):$(gid)` para evitar archivos root-owned en el output; usa `tempfile.mkdtemp` por run para el directorio temporal (evita colisiones con runs anteriores de root)
 - numcc `Dockerfile.x86` es multi-stage: stage devel compila CUDA extensions (chamfer_dist, pointops, nksr) → stage runtime copia `/opt/conda` completo; requiere `TORCH_CUDA_ARCH_LIST="7.5;8.0;8.6;8.9"` y `numpy<2`
 - numcc `pipeline.py` tiene ENTRYPOINT — al correr Docker los argumentos van directo, sin `python3 /app/pipeline.py` delante
 - numcc `remesh.py` requiere `--entrypoint python3` para activarse: `docker run --entrypoint python3 numcc:x86 /app/remesh.py ...`
 - `generate_asset.py` no soporta `--mask` para numcc — usar `tools/run_numcc.py` o Docker directamente
 - nksr submodulo en `submodules/nksr/` (nv-tlabs/nksr) — se compila en Docker build desde `submodules/nksr/package/setup.py` con `--no-build-isolation`; requiere `gitpython` para descargar OpenVDB + Eigen durante el build; tiempo de compilación ~4 min; Docker build ahora usa contexto `.` (raíz del repo): `docker build -t numcc:x86 -f models/numcc/Dockerfile.x86 .`
 - nksr wheel server (`nksr.huangjh.tech`) está permanentemente caído (NXDOMAIN); el submodulo es la única vía de instalación
-- nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — montar `~/models/nksr_cache:/root/.cache/torch` para no re-descargarlo en cada container
+- nksr checkpoint (`ks.pth`, ~55 MB) se descarga automáticamente de HuggingFace en el primer uso — `pipeline.py` monta `~/models/nksr_cache:/nksr_cache` + `-e TORCH_HOME=/nksr_cache` (no `/root/.cache/torch` — incompatible con `--user`)
 - El gitignore cubre `/assets/` — ningún asset generado se commitea
 - `pipeline.py` y scripts de tools requieren `.venv/bin/python3` (no `python3` del sistema — no tiene numpy)
 - sam2 `Dockerfile.x86*` son multi-stage: builder (devel) compila `sam2._C.so` → runtime copia `/opt/conda`; los configs YAML no se instalan con `pip install .` (wheel build ignora MANIFEST.in) — se copian explícitamente a `site-packages/sam2/configs/` para que Hydra los encuentre vía `pkg://sam2`

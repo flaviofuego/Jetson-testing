@@ -47,9 +47,11 @@ USOS
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -383,13 +385,12 @@ def stage_numcc(
     mesh_dir.mkdir(parents=True, exist_ok=True)
 
     # numcc outputs to /output/<name>/ inside Docker.
-    # We use a temp subdirectory so we can sort outputs afterwards.
-    tmp_root = mesh_dir.parent / "_numcc_tmp"
-    tmp_root.mkdir(parents=True, exist_ok=True)
+    # Fresh temp dir each run — avoids stale root-owned dirs from prior runs.
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"numcc_{name}_", dir=mesh_dir.parent))
 
-    numcc_pipeline = PROJECT_ROOT / "numcc" / "pipeline.py"
+    numcc_pipeline = PROJECT_ROOT / "models" / "numcc" / "pipeline.py"
     if not numcc_pipeline.exists():
-        sys.exit(f"numcc/pipeline.py not found at {numcc_pipeline}")
+        sys.exit(f"models/numcc/pipeline.py not found at {numcc_pipeline}")
 
     # Build color mount: color_path may be in input_dir already, or separate
     color_resolved = color_path.resolve()
@@ -402,10 +403,12 @@ def stage_numcc(
 
     cmd = [
         "docker", "run", "--rm", "--gpus", "all",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "TORCH_HOME=/nksr_cache",
         "-v", f"{input_dir}:/input:ro",
         "-v", f"{tmp_root.resolve()}:/output",
         "-v", f"{MODELS_NUMCC}:/opt/models:ro",
-        "-v", f"{NKSR_CACHE}:/root/.cache/torch",
+        "-v", f"{NKSR_CACHE}:/nksr_cache",
         "-v", f"{numcc_pipeline}:/app/pipeline.py:ro",
         *color_mount,
         DOCKER_NUMCC,
