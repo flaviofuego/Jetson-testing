@@ -474,7 +474,7 @@ Los modelos se guardan en el host y se montan en Docker:
 - `submodules/dvlt.cu`, `submodules/depth-anything-3`, `submodules/sam2` y `submodules/nksr` son submódulos git — clonar con `git clone --recurse-submodules`
 - `git config --global submodule.recurse true` para que pull/fetch actualice submódulos automáticamente
 - `sam2` es un fork de `facebookresearch/sam2` en `cristian10gf/sam2`
-- DA3 instalado en el venv de UniWhere (`/home/worker-node-4/Documents/GitHub/UniWhere/.venv`), no tiene venv propio; el editable install (`.pth`) apuntaba a `depth-anything-3/src` (ruta vieja) — se resolvió con symlink: `ln -s submodules/depth-anything-3 depth-anything-3` en la raíz del repo
+- DA3 instalado en el venv de UniWhere (`/home/worker-node-4/Documents/GitHub/UniWhere/.venv`), no tiene venv propio; el editable install apunta a `submodules/depth-anything-3/src` vía `_editable_impl_depth_anything_3.pth` — si falla `import depth_anything_3`, verificar/corregir esa ruta en el `.pth`
 - xformers instalado pero sin extensiones CUDA (torch 2.12 vs xformers compilado para 2.10) — funciona igual, solo sin memory-efficient attention
 - La IP de la Jetson cambia por DHCP — pendiente configurar IP estática en el router
 - SAM2 extensión CUDA (`sam2._C`) no compiló en la imagen x86 actual — funciona igual, solo sin post-procesado de huecos (no afecta resultados en la mayoría de casos)
