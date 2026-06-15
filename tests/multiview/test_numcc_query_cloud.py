@@ -5,62 +5,58 @@ These tests cover argument parsing only.
 """
 import sys
 import types
+import importlib.util
 from pathlib import Path
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "models" / "numcc"))
+_NUMCC_PIPELINE_PATH = Path(__file__).parent.parent.parent / "models" / "numcc" / "pipeline.py"
 
 
 def _stub_heavy_imports():
-    """Stub torch, trimesh, etc. so we can import the module header."""
-    stubs = ["torch", "torch.nn.functional", "trimesh",
-             "src.models.NU_MCC", "src.fns",
-             "src.models", "src",
-             "open3d", "imageio", "imageio.v2",
-             "PIL", "PIL.Image"]
-    for mod in stubs:
-        if mod not in sys.modules:
-            sys.modules[mod] = types.ModuleType(mod)
+    """Stub only the 3 modules imported at top-level of models/numcc/pipeline.py.
 
-    # torch needs a few attrs
-    torch_mod = sys.modules["torch"]
-    if not hasattr(torch_mod, "no_grad"):
-        torch_mod.no_grad = lambda: (lambda f: f)
-
-    # trimesh needs Trimesh class for type annotations in mesh_utils
-    trimesh_mod = sys.modules["trimesh"]
-    if not hasattr(trimesh_mod, "Trimesh"):
-        trimesh_mod.Trimesh = type("Trimesh", (), {})
-
-    # stub mesh_utils and sdf_generator so pipeline.py top-level imports succeed
-    _numcc_dir = str(Path(__file__).parent.parent.parent / "models" / "numcc")
+    torch, trimesh, imageio, PIL, src.* are only used inside function bodies —
+    stubbing them at module level would poison sys.modules for other tests that
+    use the real libraries (e.g. open3d → scipy → checks for real torch.Tensor).
+    """
     for fake_mod, attrs in [
-        ("mesh_utils", {"normalize_mesh": lambda m: m, "decompose_convex": lambda m, **kw: []}),
-        ("sdf_generator", {"generate_sdf": lambda *a, **kw: None}),
         ("pointcloud_utils", {
             "load_depth": lambda p: None,
             "depth_to_pointcloud": lambda d, **kw: None,
             "subsample_pointcloud": lambda pts, n: pts,
             "load_intrinsics": lambda p: (None, None, None, None),
             "to_y_up": lambda pts: pts,
-            "CAM_TO_YUP": [[1,0,0],[0,-1,0],[0,0,-1]],
+            "CAM_TO_YUP": [[1, 0, 0], [0, -1, 0], [0, 0, -1]],
         }),
+        ("mesh_utils", {"normalize_mesh": lambda m: m, "decompose_convex": lambda m, **kw: []}),
+        ("sdf_generator", {"generate_sdf": lambda *a, **kw: None}),
     ]:
         if fake_mod not in sys.modules:
             m = types.ModuleType(fake_mod)
             for k, v in attrs.items():
                 setattr(m, k, v)
             sys.modules[fake_mod] = m
-    return
+
+
+def _import_numcc_pipeline():
+    """Import models/numcc/pipeline.py by file path to avoid sys.path ambiguity.
+
+    tools/pipeline_scripts/pipeline.py also exists and would be found first
+    when sys.path has tools/pipeline_scripts/ at index 0 (inserted by test_registration.py
+    module-level code during pytest collection). Using spec_from_file_location bypasses
+    sys.path entirely.
+    """
+    _stub_heavy_imports()
+    spec = importlib.util.spec_from_file_location("_numcc_pipeline_mod", _NUMCC_PIPELINE_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["_numcc_pipeline_mod"] = mod
+    spec.loader.exec_module(mod)
+    return mod
 
 
 def test_argparse_query_cloud_flag():
     """--query-cloud argument is accepted and stored as a Path."""
-    _stub_heavy_imports()
-    # Re-import fresh
-    if "pipeline" in sys.modules:
-        del sys.modules["pipeline"]
-    import pipeline as numcc_pipeline
+    numcc_pipeline = _import_numcc_pipeline()
     parser = numcc_pipeline._build_parser()
     args = parser.parse_args([
         "--depth", "/tmp/d.npy",
@@ -73,10 +69,7 @@ def test_argparse_query_cloud_flag():
 
 def test_argparse_no_query_cloud_defaults_to_none():
     """Without --query-cloud, attribute is None."""
-    _stub_heavy_imports()
-    if "pipeline" in sys.modules:
-        del sys.modules["pipeline"]
-    import pipeline as numcc_pipeline
+    numcc_pipeline = _import_numcc_pipeline()
     parser = numcc_pipeline._build_parser()
     args = parser.parse_args([
         "--depth", "/tmp/d.npy", "--name", "obj", "--output", "/tmp/out",
