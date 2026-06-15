@@ -211,6 +211,7 @@ def run_numcc(
     batch_size: int = 40_000,
     n_iter: int = 10,
     debug_dir: Path | None = None,
+    query_cloud_path: "Path | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Reconstruct surface point cloud with NU-MCC.
 
@@ -375,33 +376,54 @@ def run_numcc(
         latent, up_grid_fea = model.encoder(seen_images_proc, seen_xyz_shrunk, valid_seen)
         fea = model.decoderl1(latent)
 
-    # ── query grid: anchored to model-predicted centers (demo_iphone.py approach) ──
-    # fea['anchors_xyz'] are the 200 anchor points the decoder predicts after l1.
-    # Using them (± offset) focuses the query grid where the model says the surface is,
-    # rather than relying on the depth bounding box which can be noisy.
-    centers_xyz = fea["anchors_xyz"]  # (1, 200, 3) in normalized space
-    offset = 0.3
-    c_min = centers_xyz[0].min(dim=0).values - offset  # (3,)
-    c_max = centers_xyz[0].max(dim=0).values + offset  # (3,)
+    if query_cloud_path is not None:
+        # ── --query-cloud path: use PLY points directly, bypass meshgrid ──────
+        import sys as _sys
+        import open3d as _o3d_qc
+        pcd_qc = _o3d_qc.io.read_point_cloud(str(query_cloud_path))
+        qc_pts = np.asarray(pcd_qc.points).astype(np.float32)
+        if len(qc_pts) == 0:
+            _sys.exit(f"--query-cloud PLY is empty: {query_cloud_path}")
+        # Undo Y-up rotation (merged_cloud saved Y-up; CAM_TO_YUP is self-inverse)
+        CAM_TO_YUP_INV = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float32)
+        qc_pts = (CAM_TO_YUP_INV @ qc_pts.T).T
+        # Normalise into the same space as seen_xyz
+        qc_pts_norm = (qc_pts - norm_center) / norm_scale
+        query_xyz_t = torch.from_numpy(
+            np.ascontiguousarray(qc_pts_norm)).float().unsqueeze(0).cuda()  # (1, M, 3)
+        query_xyz_shrunk = shrink_points_beyond_threshold(query_xyz_t, numcc_args.shrink_threshold)
+        # Sentinels for debug-dump block (grid_min/grid_max/centers_xyz not used in this branch)
+        grid_min = grid_max = np.zeros(3, dtype=np.float32)
+        centers_xyz = None
+        print(f"      query cloud: {len(qc_pts):,} pts from {query_cloud_path.name}")
+    else:
+        # ── default: build meshgrid from anchor bounding box (unchanged) ──────
+        # fea['anchors_xyz'] are the 200 anchor points the decoder predicts after l1.
+        # Using them (± offset) focuses the query grid where the model says the surface is,
+        # rather than relying on the depth bounding box which can be noisy.
+        centers_xyz = fea["anchors_xyz"]  # (1, 200, 3) in normalized space
+        offset = 0.3
+        c_min = centers_xyz[0].min(dim=0).values - offset  # (3,)
+        c_max = centers_xyz[0].max(dim=0).values + offset  # (3,)
 
-    # Widen to also cover the depth back-projection bounding box so we don't
-    # miss regions the depth sees but the anchors haven't centered on yet.
-    bb_min = torch.tensor(query_pts.min(axis=0) - offset, device="cuda")
-    bb_max = torch.tensor(query_pts.max(axis=0) + offset, device="cuda")
-    grid_min = torch.min(c_min, bb_min).cpu().numpy()
-    grid_max = torch.max(c_max, bb_max).cpu().numpy()
+        # Widen to also cover the depth back-projection bounding box so we don't
+        # miss regions the depth sees but the anchors haven't centered on yet.
+        bb_min = torch.tensor(query_pts.min(axis=0) - offset, device="cuda")
+        bb_max = torch.tensor(query_pts.max(axis=0) + offset, device="cuda")
+        grid_min = torch.min(c_min, bb_min).cpu().numpy()
+        grid_max = torch.max(c_max, bb_max).cpu().numpy()
 
-    n_side = int(np.cbrt(n_query))
-    xs = np.linspace(grid_min[0], grid_max[0], n_side)
-    ys = np.linspace(grid_min[1], grid_max[1], n_side)
-    zs = np.linspace(grid_min[2], grid_max[2], n_side)
-    grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
-    query_xyz_t = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).cuda()  # (1, Q, 3)
-    query_xyz_shrunk = shrink_points_beyond_threshold(query_xyz_t, numcc_args.shrink_threshold)
-    print(f"      query grid: {len(grid):,} pts  "
-          f"X=[{grid_min[0]:.2f},{grid_max[0]:.2f}]  "
-          f"Y=[{grid_min[1]:.2f},{grid_max[1]:.2f}]  "
-          f"Z=[{grid_min[2]:.2f},{grid_max[2]:.2f}]  (normalized)")
+        n_side = int(np.cbrt(n_query))
+        xs = np.linspace(grid_min[0], grid_max[0], n_side)
+        ys = np.linspace(grid_min[1], grid_max[1], n_side)
+        zs = np.linspace(grid_min[2], grid_max[2], n_side)
+        grid = np.stack(np.meshgrid(xs, ys, zs, indexing="ij"), axis=-1).reshape(-1, 3)
+        query_xyz_t = torch.from_numpy(grid.astype(np.float32)).unsqueeze(0).cuda()  # (1, Q, 3)
+        query_xyz_shrunk = shrink_points_beyond_threshold(query_xyz_t, numcc_args.shrink_threshold)
+        print(f"      query grid: {len(grid):,} pts  "
+              f"X=[{grid_min[0]:.2f},{grid_max[0]:.2f}]  "
+              f"Y=[{grid_min[1]:.2f},{grid_max[1]:.2f}]  "
+              f"Z=[{grid_min[2]:.2f},{grid_max[2]:.2f}]  (normalized)")
 
     # ── pass 1: evaluate UDF on query grid, collect candidate points ─────────
     total_q = query_xyz_shrunk.shape[1]
@@ -452,7 +474,7 @@ def run_numcc(
             debug_dir, seen_images, seen_images_proc, seen_xyz_t, valid_seen,
             norm_center, norm_scale, grid_min, grid_max,
             all_udf, cand_all, surface_pts, udf_threshold,
-            anchors=centers_xyz[0].detach().cpu().numpy(),
+            anchors=centers_xyz[0].detach().cpu().numpy() if centers_xyz is not None else np.zeros((0, 3)),
         )
 
     return surface_pts, norm_center, norm_scale
@@ -864,7 +886,8 @@ def _apply_mask_to_pointcloud(
     return filtered_pts, v_obj, u_obj
 
 
-def main():
+def _build_parser() -> argparse.ArgumentParser:
+    """Build and return the argument parser for the NU-MCC pipeline."""
     parser = argparse.ArgumentParser(description="NU-MCC asset generation pipeline")
     parser.add_argument("--depth",      required=True, type=Path,
                         help="Full (unmasked) depth file (.npy float32 meters or .png uint16 mm). "
@@ -919,6 +942,13 @@ def main():
                              "(seen image, seen_xyz map, valid mask, points) and outputs "
                              "(candidates, surface, UDF values, completion summary) to this "
                              "directory for inspection.")
+    parser.add_argument("--query-cloud", default=None, type=Path,
+                        help="PLY file of pre-built query points. Bypasses internal meshgrid.")
+    return parser
+
+
+def main():
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.intrinsics is None and any(v is None for v in [args.fx, args.fy, args.cx, args.cy]):
@@ -1035,6 +1065,7 @@ def main():
         batch_size=6_000,
         n_iter=args.udf_n_iter,
         debug_dir=args.debug_dump,
+        query_cloud_path=args.query_cloud,
     )
 
     # Convert floor depth to normalized space (same coord system as surface_pts)
