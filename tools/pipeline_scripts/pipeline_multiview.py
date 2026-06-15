@@ -444,6 +444,113 @@ def stage_sam2_all(
     }
 
 
+def stage_sam2_bbox_fallback(
+    images: list[Path],
+    name: str,
+    sam2_dir: Path,
+    segmask_paths: list[Path | None],
+    best_idx: int,
+    depths: list[Path],
+    intrinsics: list[Path],
+    extrinsics: np.ndarray,
+    monitor: VRAMMonitor,
+    sam2_model: str = "small",
+) -> list[Path | None]:
+    """
+    For views where AMG produced a poor mask (area_ratio outside [0.25, 4.0] vs best view),
+    re-run SAM2 with a bbox prompt derived from the best-view 3D cloud.
+    Returns updated segmask_paths list.
+    """
+    header("STAGE 3 — SAM2 bbox fallback for poor masks")
+
+    best_mask_path = segmask_paths[best_idx]
+    if best_mask_path is None:
+        print("  Best view has no mask — skipping bbox fallback")
+        return segmask_paths
+
+    mask_best = np.load(str(best_mask_path)).astype(np.uint8)
+    depth_best = np.load(str(depths[best_idx])).astype(np.float32)
+    intri_best = json.loads(Path(intrinsics[best_idx]).read_text())
+    fx_b, fy_b = intri_best["fx"], intri_best["fy"]
+    cx_b, cy_b = intri_best["cx"], intri_best["cy"]
+    R_best = extrinsics[best_idx, :, :3]
+    t_best = extrinsics[best_idx, :, 3]
+
+    # Back-project best view depth filtered by mask → world frame
+    H_b, W_b = depth_best.shape
+    m_best_resized = mask_best
+    if mask_best.shape != (H_b, W_b):
+        from PIL import Image as PILImage
+        m_img = PILImage.fromarray(mask_best*255).resize((W_b, H_b), PILImage.NEAREST)
+        m_best_resized = (np.asarray(m_img) > 0).astype(np.uint8)
+
+    # Simple inline back-projection
+    v_idx, u_idx = np.where((depth_best > 0) & (m_best_resized > 0))
+    Z = depth_best[v_idx, u_idx]
+    X = (u_idx - cx_b) * Z / fx_b
+    Y = (v_idx - cy_b) * Z / fy_b
+    pts_cam_best = np.stack([X, Y, Z], axis=1).astype(np.float32)
+    pts_world = _transform_to_world(pts_cam_best, R_best, t_best)
+
+    updated = list(segmask_paths)
+    any_fallback = False
+
+    for i, img in enumerate(images):
+        if i == best_idx or segmask_paths[i] is None:
+            continue
+        mask_i = np.load(str(segmask_paths[i])).astype(np.uint8)
+        if _area_ratio_ok(mask_i, mask_best):
+            print(f"  View {i}: mask OK (area_ratio in range)")
+            continue
+
+        print(f"  View {i}: mask poor → running SAM2 bbox prompt")
+        any_fallback = True
+
+        intri_i = json.loads(Path(intrinsics[i]).read_text())
+        fx_i, fy_i = intri_i["fx"], intri_i["fy"]
+        cx_i, cy_i = intri_i["cx"], intri_i["cy"]
+        R_i = extrinsics[i, :, :3]
+        t_i = extrinsics[i, :, 3]
+        depth_i = np.load(str(depths[i]))
+        H_i, W_i = depth_i.shape
+
+        bbox = _project_to_bbox(pts_world, R_i, t_i, fx_i, fy_i, cx_i, cy_i, H_i, W_i)
+        print(f"    projected bbox: {bbox}")
+
+        view_out = sam2_dir / f"view_{i}_bbox"
+        view_out.mkdir(exist_ok=True)
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            "-v", f"{img.resolve().parent}:/input:ro",
+            "-v", f"{view_out.resolve()}:/output",
+            "-v", f"{MODELS_SAM2}:/opt/sam2/checkpoints:ro",
+            "-v", f"{PROJECT_ROOT / 'submodules' / 'sam2' / 'pipeline.py'}:/opt/sam2/pipeline.py:ro",
+            "--entrypoint", "python3",
+            DOCKER_SAM2,
+            "/opt/sam2/pipeline.py",
+            "--input",  f"/input/{img.name}",
+            "--output", "/output",
+            "--name",   f"{name}_{i}",
+            "--model",  sam2_model,
+            "--bbox",   str(bbox[0]), str(bbox[1]), str(bbox[2]), str(bbox[3]),
+        ]
+        run(cmd)
+
+        new_mask = view_out / f"{name}_{i}_segmask.npy"
+        if new_mask.exists():
+            dst = sam2_dir / f"{name}_segmask_{i}.npy"
+            shutil.move(str(new_mask), str(dst))
+            updated[i] = dst
+            m_new = np.load(str(dst))
+            print(f"    bbox mask: sum={m_new.sum()}")
+        shutil.rmtree(str(view_out), ignore_errors=True)
+
+    if not any_fallback:
+        print("  All masks passed quality check — no fallback needed")
+
+    return updated
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Multiview pipeline: image directory → OBJ mesh",
@@ -538,7 +645,23 @@ def main():
             sam2_result["t1"] = time.time()
             stages["SAM2"] = sam2_result
 
-        print("\n  [stub] Stages 3-6 not yet implemented")
+        # [3] bbox fallback (runs if neither --skip-sam2 stage lock nor --skip-merge requested)
+        if not args.skip_merge:
+            segmask_paths = stage_sam2_bbox_fallback(
+                images, args.name, dir_sam2,
+                sam2_result["segmask_paths"],
+                sam2_result["best_idx"],
+                da3_result["depths"],
+                da3_result["intrinsics"],
+                da3_result["extrinsics"],
+                monitor,
+                sam2_model=args.sam2_model,
+            )
+        else:
+            segmask_paths = sam2_result["segmask_paths"]
+        best_idx = sam2_result["best_idx"]
+
+        print("\n  [stub] Stages 4-6 not yet implemented")
 
     except subprocess.CalledProcessError as e:
         print(f"\nPipeline failed (exit {e.returncode})", file=sys.stderr)
