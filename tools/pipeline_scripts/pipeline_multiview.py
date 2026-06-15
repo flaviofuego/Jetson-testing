@@ -60,7 +60,7 @@ def _centerness_distance(mask: np.ndarray, H: int, W: int) -> float:
 
 def _area_ratio_ok(mask_i: np.ndarray, mask_best: np.ndarray,
                    lo: float = 0.25, hi: float = 4.0) -> bool:
-    """Return True if mask_i area is within [lo, hi]× the best-view mask area."""
+    """Return True if mask_i area is within [lo, hi]x the best-view mask area."""
     best_area = int(mask_best.sum())
     if best_area == 0:
         return False
@@ -131,5 +131,299 @@ def _save_ply(path: Path, pts: np.ndarray, colors: np.ndarray | None = None):
         f.write(data.tobytes())
 
 
+# ─── VRAM Monitor ─────────────────────────────────────────────────────────────
+
+class VRAMMonitor:
+    def __init__(self, poll_ms: int = 200):
+        self._poll_ms = poll_ms
+        self._data: list[tuple[float, int]] = []
+        self._lock = threading.Lock()
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=2.0)
+
+    def _loop(self):
+        while self._running:
+            mb = self._query()
+            if mb is not None:
+                with self._lock:
+                    self._data.append((time.time(), mb))
+            time.sleep(self._poll_ms / 1000.0)
+
+    def _query(self) -> int | None:
+        try:
+            r = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if r.returncode == 0:
+                return int(r.stdout.strip())
+        except Exception:
+            pass
+        return None
+
+    def current_mb(self) -> int:
+        v = self._query()
+        return v if v is not None else 0
+
+    def peak_mb(self, t0: float, t1: float) -> int:
+        with self._lock:
+            vals = [mb for t, mb in self._data if t0 <= t <= t1]
+        return max(vals) if vals else self.current_mb()
+
+    def save_csv(self, path: Path):
+        with self._lock:
+            rows = list(self._data)
+        with open(path, "w") as f:
+            f.write("timestamp_s,used_mb\n")
+            for t, mb in rows:
+                f.write(f"{t:.3f},{mb}\n")
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def header(title: str):
+    print(f"\n{'='*62}\n  {title}\n{'='*62}")
+
+
+def run(cmd: list) -> subprocess.CompletedProcess:
+    print(f"  $ {' '.join(str(c) for c in cmd)}")
+    return subprocess.run(cmd, check=True)
+
+
+def _save_depth_vis_2panel(depth: np.ndarray, original_image: Path, out_path: Path):
+    """2-panel depth viz: original | depth colourised."""
+    try:
+        from PIL import Image as PILImage
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.cm as cm
+        H, W = depth.shape
+        d_min, d_max = float(depth.min()), float(depth.max())
+        d_norm = (depth - d_min) / max(d_max - d_min, 1e-6)
+        depth_rgb = (cm.turbo(d_norm)[:, :, :3] * 255).astype(np.uint8)
+        orig = PILImage.open(str(original_image)).convert("RGB").resize((W, H), PILImage.LANCZOS)
+        panel = PILImage.new("RGB", (W * 2, H))
+        panel.paste(orig, (0, 0))
+        panel.paste(PILImage.fromarray(depth_rgb), (W, 0))
+        panel.save(str(out_path))
+    except Exception as e:
+        print(f"      [depth_vis] skipped ({e})")
+
+
+def _save_depth_vis_3panel(depth: np.ndarray, mask_bool: np.ndarray,
+                            original_image: Path, out_path: Path):
+    """3-panel depth viz: original | depth | depth x mask."""
+    try:
+        from PIL import Image as PILImage
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.cm as cm
+        H, W = depth.shape
+        d_min, d_max = float(depth.min()), float(depth.max())
+        d_norm = (depth - d_min) / max(d_max - d_min, 1e-6)
+        depth_rgb = (cm.turbo(d_norm)[:, :, :3] * 255).astype(np.uint8)
+        obj_rgb = depth_rgb.copy()
+        if mask_bool.shape == (H, W):
+            obj_rgb[~mask_bool] = 20
+        orig = PILImage.open(str(original_image)).convert("RGB").resize((W, H), PILImage.LANCZOS)
+        panel = PILImage.new("RGB", (W * 3, H))
+        panel.paste(orig, (0, 0))
+        panel.paste(PILImage.fromarray(depth_rgb), (W, 0))
+        panel.paste(PILImage.fromarray(obj_rgb), (W * 2, 0))
+        panel.save(str(out_path))
+    except Exception as e:
+        print(f"      [depth_vis_3] skipped ({e})")
+
+
+# ─── Stage 1: DA3 multiview ───────────────────────────────────────────────────
+
+def stage_da3(images: list[Path], out_dir: Path, monitor: VRAMMonitor) -> dict:
+    """
+    Run DA3 on N images simultaneously.
+    Returns: {depths: list[Path], intrinsics: list[Path], extrinsics_npy: Path, t0, t1, peak_mb}
+    """
+    header("STAGE 1 — DA3 multiview depth estimation")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    if not DA3_CLI.exists():
+        sys.exit(f"DA3 CLI not found: {DA3_CLI}\n"
+                 "Activate UniWhere venv: source /home/worker-node-4/Documents/GitHub/UniWhere/.venv/bin/activate")
+
+    # DA3 'images' subcommand takes a directory; all images must be in the same dir
+    images_dir = images[0].parent
+    t0 = time.time()
+    run([str(DA3_CLI), "images", str(images_dir),
+         "--export-format", "npz",
+         "--export-dir", str(out_dir),
+         "--auto-cleanup"])
+    t1 = time.time()
+
+    npz_files = sorted(out_dir.rglob("*.npz"))
+    if not npz_files:
+        sys.exit(f"DA3 produced no .npz in {out_dir}")
+    npz_path = npz_files[0]
+
+    data = np.load(str(npz_path), allow_pickle=True)
+    print(f"  NPZ keys: {list(data.keys())}")
+
+    # depth: (N, H, W) or (H, W) for single image
+    raw_depth = data["depth"].astype(np.float32)
+    if raw_depth.ndim == 2:
+        raw_depth = raw_depth[None]   # (1, H, W)
+    N = raw_depth.shape[0]
+    print(f"  Views: {N}  depth shape: {raw_depth.shape}")
+
+    # intrinsics: (N, 3, 3)
+    raw_intri = data["intrinsics"] if "intrinsics" in data else None
+    if raw_intri is not None and raw_intri.ndim == 2:
+        raw_intri = raw_intri[None]
+
+    # extrinsics: (N, 3, 4) — camera-to-world [R|t]
+    raw_extri = data["extrinsics"] if "extrinsics" in data else None
+    if raw_extri is not None and raw_extri.ndim == 2:
+        raw_extri = raw_extri[None]
+
+    depth_paths, intri_paths = [], []
+    for i in range(N):
+        depth_i = np.clip(raw_depth[i], 0.05, 20.0)
+        d_path = out_dir / f"depth_{i}.npy"
+        np.save(str(d_path), depth_i)
+        depth_paths.append(d_path)
+        print(f"  depth_{i}: shape={depth_i.shape}  [{depth_i.min():.3f},{depth_i.max():.3f}] m")
+
+        H_i, W_i = depth_i.shape
+        if raw_intri is not None and i < len(raw_intri):
+            K = raw_intri[i]
+            intri = {"fx": float(K[0,0]), "fy": float(K[1,1]),
+                     "cx": float(K[0,2]), "cy": float(K[1,2])}
+        else:
+            fx = W_i / (2 * np.tan(np.radians(60) / 2))
+            intri = {"fx": fx, "fy": fx, "cx": float(W_i/2), "cy": float(H_i/2)}
+            print(f"    fallback intrinsics (60 deg HFOV)")
+        k_path = out_dir / f"intrinsics_{i}.json"
+        k_path.write_text(json.dumps(intri, indent=2))
+        intri_paths.append(k_path)
+        print(f"  intrinsics_{i}: fx={intri['fx']:.1f} fy={intri['fy']:.1f} "
+              f"cx={intri['cx']:.1f} cy={intri['cy']:.1f}")
+
+        _save_depth_vis_2panel(depth_i, images[i], out_dir / f"depth_vis_{i}.png")
+
+    # Save extrinsics as (N, 3, 4)
+    if raw_extri is not None:
+        extri_arr = raw_extri[:N].astype(np.float32)
+    else:
+        # identity for all views (single-image fallback)
+        extri_arr = np.zeros((N, 3, 4), dtype=np.float32)
+        extri_arr[:, :3, :3] = np.eye(3)
+    extri_path = out_dir / "extrinsics.npy"
+    np.save(str(extri_path), extri_arr)
+    print(f"  extrinsics: shape={extri_arr.shape}")
+
+    peak = monitor.peak_mb(t0, t1)
+    print(f"\n  Time: {t1-t0:.1f}s  |  Peak VRAM: {peak} MB")
+
+    return {
+        "depths": depth_paths,
+        "intrinsics": intri_paths,
+        "extrinsics_npy": extri_path,
+        "extrinsics": extri_arr,
+        "t0": t0, "t1": t1, "peak_mb": peak,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="Multiview pipeline: image directory → OBJ mesh",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+    ap.add_argument("--views-dir",   required=True, type=Path,
+                    help="Directory containing N images (*.jpg *.png), sorted alphabetically")
+    ap.add_argument("--name",        required=True,
+                    help="Asset name (determines output subdirectory)")
+    ap.add_argument("--output-dir",  type=Path, default=Path("output"))
+    ap.add_argument("--mesh-method", default="noksr", choices=["noksr", "poisson"])
+    ap.add_argument("--voxel-size",  type=float, default=0.005)
+    ap.add_argument("--sam2-model",  default="small", choices=["tiny", "small", "base_plus"])
+    ap.add_argument("--sam2-pred-iou-thresh",   type=float, default=0.88)
+    ap.add_argument("--sam2-stability-thresh",  type=float, default=0.95)
+    ap.add_argument("--skip-da3",    action="store_true")
+    ap.add_argument("--skip-sam2",   action="store_true")
+    ap.add_argument("--skip-merge",  action="store_true")
+    ap.add_argument("--skip-smooth", action="store_true")
+    ap.add_argument("--debug",       action="store_true")
+    args = ap.parse_args()
+
+    # Collect and validate images
+    views_dir = args.views_dir.resolve()
+    if not views_dir.is_dir():
+        sys.exit(f"--views-dir not found: {views_dir}")
+    images = sorted(views_dir.glob("*.jpg")) + sorted(views_dir.glob("*.JPG")) + \
+             sorted(views_dir.glob("*.png")) + sorted(views_dir.glob("*.PNG"))
+    images = sorted(set(images))
+    if len(images) < 2:
+        sys.exit(f"Need at least 2 images in {views_dir}, found {len(images)}")
+    print(f"\n  Views ({len(images)}): {[img.name for img in images]}")
+
+    # Output dirs
+    out_root   = args.output_dir.resolve() / args.name
+    dir_da3    = out_root / "01_da3"
+    dir_sam2   = out_root / "02_sam2"
+    dir_clouds = out_root / "03_clouds"
+    dir_mesh   = out_root / "04_mesh"
+    out_root.mkdir(parents=True, exist_ok=True)
+    print(f"  Output: {out_root}")
+
+    monitor = VRAMMonitor()
+    monitor.start()
+    baseline_mb = monitor.current_mb()
+    print(f"  Baseline VRAM: {baseline_mb} MB")
+
+    stages: dict[str, dict] = {}
+
+    try:
+        # [1] DA3
+        if args.skip_da3:
+            depth_paths = sorted(dir_da3.glob("depth_*.npy"))
+            if not depth_paths:
+                sys.exit(f"--skip-da3: no depth_*.npy in {dir_da3}")
+            extri_npy = dir_da3 / "extrinsics.npy"
+            if not extri_npy.exists():
+                sys.exit(f"--skip-da3: extrinsics.npy not found in {dir_da3}")
+            extrinsics = np.load(str(extri_npy))
+            intri_paths = sorted(dir_da3.glob("intrinsics_*.json"))
+            da3_result = {"depths": depth_paths, "intrinsics": intri_paths,
+                          "extrinsics_npy": extri_npy, "extrinsics": extrinsics,
+                          "t0": 0, "t1": 0, "peak_mb": 0}
+            print(f"\n[--skip-da3] Using {len(depth_paths)} depths from {dir_da3}")
+        else:
+            da3_result = stage_da3(images, dir_da3, monitor)
+            stages["DA3"] = da3_result
+
+        print("\n  [stub] Stages 2-6 not yet implemented")
+
+    except subprocess.CalledProcessError as e:
+        print(f"\nPipeline failed (exit {e.returncode})", file=sys.stderr)
+        monitor.stop()
+        sys.exit(e.returncode)
+    except Exception as e:
+        print(f"\nPipeline failed: {e}", file=sys.stderr)
+        import traceback; traceback.print_exc()
+        monitor.stop()
+        sys.exit(1)
+    finally:
+        monitor.stop()
+
+
 if __name__ == "__main__":
-    print("pipeline_multiview.py — stub (stages not yet implemented)")
+    main()
