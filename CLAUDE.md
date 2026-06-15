@@ -64,6 +64,8 @@ models/
     requirements.txt
 tools/
   pipeline.py                    # super-pipeline unificado: imagen → output/ estructurado por stages
+  pipeline_scripts/
+    pipeline_multiview.py        # pipeline N-vistas: DA3→SAM2 AMG→bbox fallback→merge cloud→remesh→smooth
   generate_asset.py              # wrapper simple (triposr, trellis, sam2, numcc) — casos básicos
   run_numcc.py                   # wrapper numcc: full pipeline o solo remesh, elige nksr/poisson
   capture_realsense.py           # captura RGBD desde Intel RealSense → depth.npy + color.npy + intrinsics.json
@@ -339,6 +341,71 @@ Script unificado `tools/pipeline.py` — encadena todos los stages con output or
 - `06_debug/` — (solo con `--debug`) dump NU-MCC inputs/outputs
 - `pipeline_report.json` — tiempos, VRAM pico, parámetros, inventario de archivos
 - `vram_profile.csv` — uso de VRAM por stage
+
+### Pipeline multiview DA3 → SAM2 (N vistas) → merge cloud → remesh → smooth
+
+Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con N imágenes (diseñado para N=3), genera OBJ mesh sin NU-MCC (merge directo de nubes + NKSR/Poisson).
+
+**Flujo:** DA3 multiview → SAM2 AMG por vista → bbox fallback para masks malas → back-project + world-frame merge → voxel downsample → remesh (NKSR o Poisson vía `numcc:x86`) → smooth PyMeshLab
+
+```bash
+# Pipeline completo — directorio con imágenes ordenadas
+.venv/bin/python3 tools/pipeline_scripts/pipeline_multiview.py \
+    --views-dir data/images/headphones_views/ \
+    --name headphones \
+    [--output-dir output]              # default: ./output
+    [--mesh-method noksr|poisson]      # default: noksr
+    [--voxel-size 0.005]              # metros, default 0.005 (5mm)
+    [--sam2-model small|tiny|base_plus]
+    [--sam2-pred-iou-thresh 0.88]
+    [--sam2-stability-thresh 0.95]
+
+# Objetos con estructuras delgadas (arcos, asas)
+.venv/bin/python3 tools/pipeline_scripts/pipeline_multiview.py \
+    --views-dir data/images/headphones_views/ \
+    --name headphones \
+    --sam2-pred-iou-thresh 0.70 --sam2-stability-thresh 0.80
+
+# Skip stages (reusar outputs previos)
+    [--skip-da3]      # reusar 01_da3/
+    [--skip-sam2]     # reusar 02_sam2/
+    [--skip-merge]    # reusar 03_clouds/merged_cloud.ply (salta también bbox fallback)
+    [--skip-smooth]
+    [--debug]
+```
+
+**Selección de mejor vista (best_view):** `argmin(centerness_distance_i)` donde `centerness_distance = sqrt((cx_mask - W/2)² + (cy_mask - H/2)²)`. La mask más centrada es la de referencia para el bbox fallback.
+
+**Bbox fallback:** si `area_ratio_i = mask_i.sum() / mask_best.sum() ∉ [0.25, 4.0]`, back-project objeto de best_view → proyectar a image_i → re-correr SAM2 con `--bbox`. Referencia = best_view (no mediana) para evitar que mask mala sesgue el denominador.
+
+**Coordinate frame:** DA3 entrega extrinsics camera-to-world (`p_world = R @ p_cam + t`). Todos los clouds se transforman al frame de la vista 0. Se aplica rotación Y-up (`[[1,0,0],[0,-1,0],[0,0,-1]]`) al merged cloud antes del remesh.
+
+**SAM2 `--bbox` mode** (nuevo en `submodules/sam2/pipeline.py`): usa `SAM2ImagePredictor.predict(box=..., multimask_output=True)`, selecciona `masks[scores.argmax()]`. Sin `merge_centered_masks`. Activar con `--bbox x1 y1 x2 y2`.
+
+**Outputs en `output/<nombre>/`:**
+- `01_da3/` — depth_i.npy + intrinsics_i.json + extrinsics.npy + depth_vis_i.png
+- `02_sam2/` — segmask_i.npy + viz_i.png + depth_vis_masked_i.png + best_view_idx.txt
+- `03_clouds/` — *_cloud_i.ply (por vista, world frame) + *_merged_cloud.ply (voxel-downsampled)
+- `04_mesh/` — <nombre>.obj + <nombre>_smoothed.obj
+- `pipeline_report.json` + `vram_profile.csv`
+
+**Benchmarks E2E (RTX 4000 Ada, 3 vistas audífonos, iou=0.70, stab=0.80, nksr):**
+
+| Stage | Tiempo | VRAM pico |
+|-------|--------|-----------|
+| DA3 multiview | 11.6s | 10,579 MB |
+| SAM2 AMG × 3 | 41.0s | 10,579 MB |
+| Bbox fallback | 0s (skipped) | — |
+| Merge + voxel | 0.02s | 2,332 MB |
+| Remesh nksr | 14.3s | 2,723 MB |
+| Smooth | 0.8s | 2,333 MB |
+| **Total** | **67.98s** | **10,579 MB** |
+
+- Puntos por vista: view_0=27,549, view_1=17,389, view_2=18,771 → merged 63,709 → tras downsample 9,032 pts
+- OBJ final: 26,352 vértices, 51,319 caras
+- Tests: `tests/multiview/test_utils.py` — 18/18 pasan
+
+**Nota:** DA3 `da3 images <dir>` (subcommand multiview) produce NPZ con `depth(N,H,W)`, `intrinsics(N,3,3)`, `extrinsics(N,3,4)`. No usar `da3 image img1 img2` (no soportado).
 
 ### dvlt — reconstrucción gaussiana
 ```bash
