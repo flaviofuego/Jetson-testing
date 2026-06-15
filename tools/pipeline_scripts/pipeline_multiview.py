@@ -653,6 +653,88 @@ def stage_merge_clouds(
     }
 
 
+def stage_remesh(
+    merged_ply: Path,
+    name: str,
+    mesh_dir: Path,
+    mesh_method: str,
+    monitor: VRAMMonitor,
+) -> dict:
+    """Run numcc:x86 remesh.py on merged_cloud.ply → OBJ."""
+    header("STAGE 5 — Remesh  (numcc:x86 remesh.py)")
+    mesh_dir.mkdir(parents=True, exist_ok=True)
+    NKSR_CACHE.mkdir(parents=True, exist_ok=True)
+
+    input_dir = merged_ply.parent.resolve()
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"numcc_{name}_", dir=mesh_dir.parent))
+
+    numcc_remesh = PROJECT_ROOT / "models" / "numcc" / "remesh.py"
+    if not numcc_remesh.exists():
+        sys.exit(f"models/numcc/remesh.py not found: {numcc_remesh}")
+
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "TORCH_HOME=/nksr_cache",
+        "-v", f"{input_dir}:/input:ro",
+        "-v", f"{tmp_root.resolve()}:/output",
+        "-v", f"{NKSR_CACHE}:/nksr_cache",
+        "-v", f"{numcc_remesh}:/app/remesh.py:ro",
+        "--entrypoint", "python3",
+        DOCKER_NUMCC,
+        "/app/remesh.py",
+        "--cloud",       f"/input/{merged_ply.name}",
+        "--name",        name,
+        "--output",      "/output",
+        "--mesh-method", mesh_method,
+    ]
+
+    t0 = time.time()
+    run(cmd)
+    t1 = time.time()
+
+    asset_tmp = tmp_root / name
+    if not asset_tmp.exists():
+        raise RuntimeError(f"remesh.py produced no output in {asset_tmp}")
+
+    obj_path = None
+    for src in sorted(asset_tmp.iterdir()):
+        dst = mesh_dir / src.name
+        shutil.move(str(src), str(dst))
+        if dst.suffix == ".obj" and dst.stem == name:
+            obj_path = dst
+        print(f"  -> 04_mesh/{src.name}")
+    shutil.rmtree(str(tmp_root), ignore_errors=True)
+
+    if obj_path is None or not obj_path.exists():
+        raise RuntimeError(f"OBJ not found after remesh: {mesh_dir}/{name}.obj")
+
+    peak = monitor.peak_mb(t0, t1)
+    print(f"\n  OBJ: {obj_path}")
+    print(f"  Time: {t1-t0:.1f}s  |  Peak VRAM: {peak} MB")
+    return {"obj_path": obj_path, "t0": t0, "t1": t1, "peak_mb": peak}
+
+
+def stage_smooth(obj_path: Path, mesh_dir: Path, name: str, monitor: VRAMMonitor) -> dict:
+    """Run smooth_preserve.py → <name>_smoothed.obj."""
+    header("STAGE 6 — Smooth  (Clustering -> Taubin -> Two Steps -> Normal Smooth)")
+    smooth_script = PROJECT_ROOT / "tools" / "smooth_preserve.py"
+    out_obj = mesh_dir / f"{name}_smoothed.obj"
+    venv_python = PROJECT_ROOT / ".venv" / "bin" / "python3"
+    if not venv_python.exists():
+        sys.exit(f"venv python not found: {venv_python}")
+    cmd = [str(venv_python), str(smooth_script), str(obj_path), str(out_obj)]
+    t0 = time.time()
+    run(cmd)
+    t1 = time.time()
+    if not out_obj.exists():
+        raise RuntimeError(f"smooth_preserve.py did not produce {out_obj}")
+    peak = monitor.peak_mb(t0, t1)
+    print(f"\n  Smoothed: {out_obj}")
+    print(f"  Time: {t1-t0:.1f}s  |  Peak VRAM: {peak} MB")
+    return {"smoothed_obj": out_obj, "t0": t0, "t1": t1, "peak_mb": peak}
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Multiview pipeline: image directory → OBJ mesh",
@@ -779,7 +861,16 @@ def main():
             stages["merge"] = merge_result
         merged_ply = merge_result["merged_ply"]
 
-        print("\n  [stub] Stages 5-6 not yet implemented")
+        # [5] Remesh
+        result = stage_remesh(merged_ply, args.name, dir_mesh,
+                              args.mesh_method, monitor)
+        stages["remesh"] = result
+        obj_path = result["obj_path"]
+
+        # [6] Smooth
+        if not args.skip_smooth:
+            result = stage_smooth(obj_path, dir_mesh, args.name, monitor)
+            stages["smooth"] = result
 
     except subprocess.CalledProcessError as e:
         print(f"\nPipeline failed (exit {e.returncode})", file=sys.stderr)
@@ -792,6 +883,44 @@ def main():
         sys.exit(1)
     finally:
         monitor.stop()
+
+    # Report
+    real = {k: v for k, v in stages.items() if v.get("t0", 0) > 0 or v.get("t1", 0) > 0}
+    total_s = None
+    if real:
+        t_all_start = min(v["t0"] for v in real.values())
+        t_all_end   = max(v["t1"] for v in real.values())
+        total_s = round(t_all_end - t_all_start, 2)
+
+    report = {
+        "name": args.name,
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "n_views": len(images),
+        "views": [str(img) for img in images],
+        "params": {
+            "mesh_method":  args.mesh_method,
+            "voxel_size":   args.voxel_size,
+            "sam2_model":   args.sam2_model,
+        },
+        "stages": {k: {"duration_s": round(v["t1"] - v["t0"], 2),
+                       "peak_vram_mb": v.get("peak_mb", 0)}
+                   for k, v in stages.items()},
+        "total_duration_s": total_s,
+        "output_root": str(out_root),
+    }
+    (out_root / "pipeline_report.json").write_text(json.dumps(report, indent=2))
+    monitor.save_csv(out_root / "vram_profile.csv")
+
+    print("\n" + "=" * 62)
+    print("  PIPELINE COMPLETE")
+    print("=" * 62)
+    for sname, info in stages.items():
+        print(f"  {sname:<14}  {info['t1']-info['t0']:>6.1f}s  "
+              f"VRAM peak {info.get('peak_mb', 0):>5} MB")
+    if total_s:
+        print(f"\n  Total: {total_s}s")
+    print(f"  Output: {out_root}")
+    print("=" * 62)
 
 
 if __name__ == "__main__":
