@@ -158,6 +158,31 @@ python3 tools/generate_asset.py data/images/imagen.png --model sam2 --name objet
 
 **En Jetson** usar `--runtime=nvidia` en lugar de `--gpus all` en el comando docker. El `generate_asset.py` usa `--gpus all` (para x86); para Jetson correr `pipeline.py` directamente dentro del container `sam2:jetson`.
 
+### SAM2 — selector interactivo (point-click)
+
+Para casos donde AMG elige la máscara equivocada o el fondo contamina el resultado.
+
+```bash
+# Prerequisito X11 (una sola vez por sesión)
+xhost +local:docker
+
+# Correr selector interactivo
+.venv/bin/python3 submodules/sam2/pipeline_interactive.py \
+  --input data/images/objeto.jpg \
+  --output data/outputs \
+  --name objeto
+```
+
+**Controles:**
+- Click izquierdo → punto positivo (incluir en máscara)
+- Click derecho → punto negativo (excluir de máscara)
+- `R` → resetear puntos y máscara
+- `Enter` → guardar y salir (exit 0) — requiere al menos un click
+- `Q` → salir sin guardar (exit 1)
+
+**Output:** mismo formato que `pipeline.py` — `<name>.png` (fondo blanco) + `<name>_segmask.npy` (uint8) + `<name>_viz.png`.
+Compatible con `--skip-sam2` en `tools/pipeline.py` copiando los outputs a `output/<name>/02_sam2/`.
+
 ### TripoSR — generar asset
 ```bash
 # Descargar modelos (una sola vez)
