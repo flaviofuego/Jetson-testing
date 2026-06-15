@@ -764,6 +764,79 @@ def stage_merge_v2(
     }
 
 
+def stage_numcc_densify(
+    merged_ply: Path,
+    best_idx: int,
+    sam2_dir: Path,
+    da3_dir: Path,
+    name: str,
+    out_dir: Path,
+    monitor: "VRAMMonitor",
+    udf_threshold: float = 0.23,
+    mesh_method: str = "noksr",
+) -> dict:
+    """Stage 4b: run NU-MCC on merged cloud as query points, best-view as seen_xyz."""
+    header("STAGE 4b — NU-MCC densification  (--query-cloud)")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    NKSR_CACHE.mkdir(parents=True, exist_ok=True)
+
+    depth_best = da3_dir / f"depth_{best_idx}.npy"
+    intri_best = da3_dir / f"intrinsics_{best_idx}.json"
+    color_best = sam2_dir / f"{name}_{best_idx}.png"
+
+    if not depth_best.exists():
+        sys.exit(f"Stage 4b: depth not found: {depth_best}")
+    if not intri_best.exists():
+        sys.exit(f"Stage 4b: intrinsics not found: {intri_best}")
+
+    tmp_root = Path(tempfile.mkdtemp(prefix=f"numcc_densify_{name}_", dir=out_dir.parent))
+    cloud_dir = merged_ply.parent.resolve()
+    numcc_pipeline = PROJECT_ROOT / "models" / "numcc" / "pipeline.py"
+
+    cmd = [
+        "docker", "run", "--rm", "--gpus", "all",
+        "--user", f"{os.getuid()}:{os.getgid()}",
+        "-e", "TORCH_HOME=/nksr_cache",
+        "-v", f"{depth_best.parent.resolve()}:/da3:ro",
+        "-v", f"{sam2_dir.resolve()}:/sam2:ro",
+        "-v", f"{cloud_dir}:/clouds:ro",
+        "-v", f"{tmp_root.resolve()}:/output",
+        "-v", f"{MODELS_NUMCC}:/opt/models:ro",
+        "-v", f"{NKSR_CACHE}:/nksr_cache",
+        "-v", f"{numcc_pipeline}:/app/pipeline.py:ro",
+        DOCKER_NUMCC,
+        "--depth",        f"/da3/{depth_best.name}",
+        "--color",        f"/sam2/{color_best.name}",
+        "--intrinsics",   f"/da3/{intri_best.name}",
+        "--name",         name,
+        "--output",       "/output",
+        "--query-cloud",  f"/clouds/{merged_ply.name}",
+        "--udf-threshold", str(udf_threshold),
+        "--no-sdf",
+        "--mesh-method",  mesh_method,
+    ]
+
+    t0 = time.time()
+    run(cmd)
+    t1 = time.time()
+
+    surface_ply_src = tmp_root / name / f"{name}_numcc_surface.ply"
+    if not surface_ply_src.exists():
+        print(f"  [WARN] Stage 4b: no numcc_surface.ply produced — will use merged_cloud.ply")
+        shutil.rmtree(str(tmp_root), ignore_errors=True)
+        peak = monitor.peak_mb(t0, t1)
+        return {"surface_ply": None, "t0": t0, "t1": t1, "peak_mb": peak}
+
+    surface_ply_dst = out_dir / f"{name}_numcc_surface.ply"
+    shutil.move(str(surface_ply_src), str(surface_ply_dst))
+    shutil.rmtree(str(tmp_root), ignore_errors=True)
+
+    peak = monitor.peak_mb(t0, t1)
+    print(f"  Surface PLY: {surface_ply_dst}")
+    print(f"  Time: {t1-t0:.1f}s  |  Peak VRAM: {peak} MB")
+    return {"surface_ply": surface_ply_dst, "t0": t0, "t1": t1, "peak_mb": peak}
+
+
 def stage_remesh(
     merged_ply: Path,
     name: str,
