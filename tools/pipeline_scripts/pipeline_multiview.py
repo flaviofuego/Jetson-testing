@@ -341,6 +341,109 @@ def stage_da3(images: list[Path], out_dir: Path, monitor: VRAMMonitor) -> dict:
     }
 
 
+def stage_sam2_all(
+    images: list[Path],
+    name: str,
+    out_dir: Path,
+    monitor: VRAMMonitor,
+    depths: list[Path],
+    sam2_model: str = "small",
+    pred_iou_thresh: float = 0.88,
+    stability_score_thresh: float = 0.95,
+) -> dict:
+    """
+    Run SAM2 AMG on all N views. Returns best_idx (most centred mask).
+    """
+    header("STAGE 2 — SAM2 AMG (all views) + best view selection")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    segmask_paths: list[Path] = []
+    centerness_scores: list[float] = []
+
+    for i, img in enumerate(images):
+        print(f"\n  --- View {i}: {img.name} ---")
+        view_out = out_dir / f"view_{i}"
+        view_out.mkdir(exist_ok=True)
+
+        cmd = [
+            "docker", "run", "--rm", "--gpus", "all",
+            "-v", f"{img.resolve().parent}:/input:ro",
+            "-v", f"{view_out.resolve()}:/output",
+            "-v", f"{MODELS_SAM2}:/opt/sam2/checkpoints:ro",
+            "-v", f"{PROJECT_ROOT / 'submodules' / 'sam2' / 'pipeline.py'}:/opt/sam2/pipeline.py:ro",
+            "--entrypoint", "python3",
+            DOCKER_SAM2,
+            "/opt/sam2/pipeline.py",
+            "--input",  f"/input/{img.name}",
+            "--output", "/output",
+            "--name",   f"{name}_{i}",
+            "--model",  sam2_model,
+            "--pred-iou-thresh",        str(pred_iou_thresh),
+            "--stability-score-thresh", str(stability_score_thresh),
+        ]
+        t_i0 = time.time()
+        run(cmd)
+        t_i1 = time.time()
+        print(f"    SAM2 view {i}: {t_i1-t_i0:.1f}s")
+
+        # Move outputs to 02_sam2/ flat structure
+        segmask_src = view_out / f"{name}_{i}_segmask.npy"
+        viz_src     = view_out / f"{name}_{i}_viz.png"
+        segmask_dst = out_dir / f"{name}_segmask_{i}.npy"
+        viz_dst     = out_dir / f"{name}_viz_{i}.png"
+        if not segmask_src.exists():
+            print(f"  WARNING: SAM2 view {i} produced no segmask — skipping view")
+            segmask_paths.append(None)
+            centerness_scores.append(float("inf"))
+            continue
+        shutil.move(str(segmask_src), str(segmask_dst))
+        if viz_src.exists():
+            shutil.move(str(viz_src), str(viz_dst))
+        shutil.rmtree(str(view_out), ignore_errors=True)
+        segmask_paths.append(segmask_dst)
+
+        # Centerness score
+        mask = np.load(str(segmask_dst)).astype(np.uint8)
+        from PIL import Image as PILImage
+        img_np = np.array(PILImage.open(str(img)).convert('RGB'))
+        H, W = img_np.shape[:2]
+        score = _centerness_distance(mask, H, W)
+        centerness_scores.append(score)
+        print(f"    centerness_distance={score:.1f}  mask_sum={mask.sum()}")
+
+    # best view = smallest centerness distance (closest to centre)
+    valid_scores = [(s, i) for i, s in enumerate(centerness_scores)
+                    if s < float("inf") and segmask_paths[i] is not None]
+    if not valid_scores:
+        sys.exit("SAM2 failed on all views — no valid segmask produced")
+    best_idx = min(valid_scores, key=lambda x: x[0])[1]
+    print(f"\n  Best view: {best_idx}  (centerness={centerness_scores[best_idx]:.1f})")
+
+    (out_dir / "best_view_idx.txt").write_text(str(best_idx))
+
+    # Generate depth_vis_masked for each view (3-panel) using saved masks
+    for i, img in enumerate(images):
+        if segmask_paths[i] is None:
+            continue
+        depth = np.load(str(depths[i]))
+        mask = np.load(str(segmask_paths[i])).astype(bool)
+        # Resize mask to depth resolution if needed
+        if mask.shape != depth.shape:
+            from PIL import Image as PILImage
+            m_img = PILImage.fromarray(mask.astype(np.uint8)*255).resize(
+                (depth.shape[1], depth.shape[0]), PILImage.NEAREST)
+            mask = np.asarray(m_img) > 0
+        _save_depth_vis_3panel(depth, mask, img, out_dir / f"depth_vis_masked_{i}.png")
+
+    peak = monitor.peak_mb(0, time.time())  # cumulative
+    return {
+        "segmask_paths": segmask_paths,
+        "centerness_scores": centerness_scores,
+        "best_idx": best_idx,
+        "t0": 0, "t1": 0, "peak_mb": peak,  # individual timing tracked per-view above
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Multiview pipeline: image directory → OBJ mesh",
@@ -410,7 +513,32 @@ def main():
             da3_result = stage_da3(images, dir_da3, monitor)
             stages["DA3"] = da3_result
 
-        print("\n  [stub] Stages 2-6 not yet implemented")
+        # [2] SAM2 AMG
+        if args.skip_sam2:
+            segmask_paths = sorted(dir_sam2.glob(f"{args.name}_segmask_*.npy"))
+            if not segmask_paths:
+                sys.exit(f"--skip-sam2: no segmasks in {dir_sam2}")
+            best_view_file = dir_sam2 / "best_view_idx.txt"
+            best_idx = int(best_view_file.read_text()) if best_view_file.exists() else 0
+            centerness_scores = [float("inf")] * len(images)
+            sam2_result = {"segmask_paths": segmask_paths, "best_idx": best_idx,
+                           "centerness_scores": centerness_scores,
+                           "t0": 0, "t1": 0, "peak_mb": 0}
+            print(f"\n[--skip-sam2] Using {len(segmask_paths)} masks, best_idx={best_idx}")
+        else:
+            t0_sam2 = time.time()
+            sam2_result = stage_sam2_all(
+                images, args.name, dir_sam2, monitor,
+                depths=da3_result["depths"],
+                sam2_model=args.sam2_model,
+                pred_iou_thresh=args.sam2_pred_iou_thresh,
+                stability_score_thresh=args.sam2_stability_thresh,
+            )
+            sam2_result["t0"] = t0_sam2
+            sam2_result["t1"] = time.time()
+            stages["SAM2"] = sam2_result
+
+        print("\n  [stub] Stages 3-6 not yet implemented")
 
     except subprocess.CalledProcessError as e:
         print(f"\nPipeline failed (exit {e.returncode})", file=sys.stderr)
