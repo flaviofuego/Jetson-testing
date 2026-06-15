@@ -376,7 +376,7 @@ Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con 
 
 **Selección de mejor vista (best_view):** `argmin(centerness_distance_i)` donde `centerness_distance = sqrt((cx_mask - W/2)² + (cy_mask - H/2)²)`. La mask más centrada es la de referencia para el bbox fallback.
 
-**Bbox re-segmentación (Stage 3, siempre):** para TODAS las vistas no-best, back-project objeto de best_view → proyectar a image_i → re-correr SAM2 con `--bbox`. AMG no se usa para vistas no-best: puede producir masks de área correcta pero contaminadas con el fondo en ángulos difíciles (ej. vista cenital de audífonos — arco delgado deja pasar el fondo). Solo best_view usa AMG.
+**Bbox re-segmentación (Stage 3, siempre para vistas no-best):** para TODAS las vistas no-best, back-project objeto de best_view → proyectar a image_i → re-correr SAM2 con `--bbox`. AMG no se usa para vistas no-best: puede producir masks de área correcta pero contaminadas con el fondo en ángulos difíciles (ej. vista cenital de audífonos — arco delgado deja pasar el fondo). Solo best_view usa AMG. Limitación: si una vista no-best es casi espejo de best_view (ej. izquierdo vs derecho), el bbox proyectado puede tener score SAM2 ~0 y la mask resultante es pequeña → pocos puntos de esa vista en el merge.
 
 **Coordinate frame:** DA3 entrega extrinsics camera-to-world (`p_world = R @ p_cam + t`). Todos los clouds se transforman al frame de la vista 0. Se aplica rotación Y-up (`[[1,0,0],[0,-1,0],[0,0,-1]]`) al merged cloud antes del remesh.
 
@@ -389,20 +389,23 @@ Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con 
 - `04_mesh/` — <nombre>.obj + <nombre>_smoothed.obj
 - `pipeline_report.json` + `vram_profile.csv`
 
-**Benchmarks E2E (RTX 4000 Ada, 3 vistas audífonos, iou=0.70, stab=0.80, nksr):**
+**Benchmarks E2E (RTX 4000 Ada, 3 vistas audífonos reales centro+derecho+izquierdo, iou=0.70, stab=0.80, nksr):**
 
 | Stage | Tiempo | VRAM pico |
 |-------|--------|-----------|
-| DA3 multiview | 11.6s | 10,579 MB |
-| SAM2 AMG × 3 | 41.0s | 10,579 MB |
-| Bbox fallback | 0s (skipped) | — |
-| Merge + voxel | 0.02s | 2,332 MB |
-| Remesh nksr | 14.3s | 2,723 MB |
-| Smooth | 0.8s | 2,333 MB |
-| **Total** | **67.98s** | **10,579 MB** |
+| DA3 multiview | 11.8s | 9,730 MB |
+| SAM2 AMG × 3 | 39.3s | 9,730 MB |
+| SAM2 bbox (vistas 0 y 2) | incluido arriba | — |
+| Merge + voxel | 0.01s | 1,479 MB |
+| Remesh nksr | 13.3s | 1,837 MB |
+| Smooth | 0.4s | 1,484 MB |
+| **Total** | **73.6s** | **9,730 MB** |
 
-- Puntos por vista: view_0=27,549, view_1=17,389, view_2=18,771 → merged 63,709 → tras downsample 9,032 pts
-- OBJ final: 26,352 vértices, 51,319 caras
+- Dataset: `headphones_centro.jpeg` (view_0) + `headphones_derecho.jpeg` (view_1, best) + `headphones_izquierdo.jpeg` (view_2)
+- best_view = view_1 (derecho, centerness=42.3); vistas 0 y 2 re-segmentadas con bbox proyectado desde view_1
+- Puntos por vista: view_0=16,197 (bbox) + view_1=17,389 (AMG) + view_2=3,570 (bbox) → merged 37,156 → tras downsample 5,368 pts
+- OBJ final: 15,614 vértices, 29,878 caras pre-smooth → 11,655 vértices, 22,162 caras suavizado
+- view_2 (izquierdo) da pocos pts: bbox proyectado desde derecho tiene scores ~0 en esa perspectiva — geometría espejo reduce overlap
 - Tests: `tests/multiview/test_utils.py` — 18/18 pasan
 
 **Nota:** DA3 `da3 images <dir>` (subcommand multiview) produce NPZ con `depth(N,H,W)`, `intrinsics(N,3,3)`, `extrinsics(N,3,4)`. No usar `da3 image img1 img2` (no soportado).
