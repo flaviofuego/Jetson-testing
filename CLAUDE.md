@@ -65,7 +65,7 @@ models/
 tools/
   pipeline.py                    # super-pipeline unificado: imagen → output/ estructurado por stages
   pipeline_scripts/
-    pipeline_multiview.py        # pipeline N-vistas: DA3→SAM2 AMG→bbox fallback→merge cloud→remesh→smooth
+    pipeline_multiview.py        # pipeline N-vistas v2: DA3→SAM2 AMG→FPFH+ICP merge→[NU-MCC]→remesh→smooth
   generate_asset.py              # wrapper simple (triposr, trellis, sam2, numcc) — casos básicos
   run_numcc.py                   # wrapper numcc: full pipeline o solo remesh, elige nksr/poisson
   capture_realsense.py           # captura RGBD desde Intel RealSense → depth.npy + color.npy + intrinsics.json
@@ -407,11 +407,13 @@ Script unificado `tools/pipeline.py` — encadena todos los stages con output or
 - `pipeline_report.json` — tiempos, VRAM pico, parámetros, inventario de archivos
 - `vram_profile.csv` — uso de VRAM por stage
 
-### Pipeline multiview DA3 → SAM2 (N vistas) → merge cloud → remesh → smooth
+### Pipeline multiview v2 — DA3 → SAM2 (N vistas) → FPFH+ICP merge → remesh → smooth
 
-Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con N imágenes (diseñado para N=3), genera OBJ mesh sin NU-MCC (merge directo de nubes + NKSR/Poisson).
+Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con N imágenes (diseñado para N=3), genera OBJ mesh.
 
-**Flujo:** DA3 multiview → SAM2 AMG por vista → bbox fallback para masks malas → back-project + world-frame merge → voxel downsample → remesh (NKSR o Poisson vía `numcc:x86`) → smooth PyMeshLab
+**Flujo v2:** DA3 multiview → SAM2 AMG por vista (todas) → FPFH+ICP registration (object-centric, ref=best_view) → bbox fallback para vistas con rmse alto → merge + voxel downsample → [opcional: NU-MCC densificación con `--use-numcc`] → remesh (NKSR o Poisson vía `numcc:x86`) → smooth PyMeshLab
+
+**Cambio principal vs v1:** v1 usaba extrinsics de DA3 para transformar las nubes al world frame → fallaba para vistas wide-baseline (DA3 no generaliza a fotografía de producto, el objeto aparecía en 2+ posiciones). v2 usa FPFH global registration + ICP refinement object-centric (centroid-subtracted): cada nube se centra en su propio centroide, se registra a la nube ref (best_view), sin depender de DA3 extrinsics.
 
 ```bash
 # Pipeline completo — directorio con imágenes ordenadas
@@ -424,6 +426,10 @@ Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con 
     [--sam2-model small|tiny|base_plus]
     [--sam2-pred-iou-thresh 0.88]
     [--sam2-stability-thresh 0.95]
+    [--registration fpfh|icp]         # default: fpfh (icp para vistas narrow-baseline)
+    [--icp-threshold 0.02]            # metros, distancia max ICP
+    [--use-numcc]                     # Stage 4b: densificar nube con NU-MCC antes del remesh
+    [--udf-threshold 0.23]            # solo con --use-numcc
 
 # Objetos con estructuras delgadas (arcos, asas)
 .venv/bin/python3 tools/pipeline_scripts/pipeline_multiview.py \
@@ -434,44 +440,69 @@ Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con 
 # Skip stages (reusar outputs previos)
     [--skip-da3]      # reusar 01_da3/
     [--skip-sam2]     # reusar 02_sam2/
-    [--skip-merge]    # reusar 03_clouds/merged_cloud.ply (salta también bbox fallback)
+    [--skip-merge]    # reusar 03_clouds/merged_cloud.ply
     [--skip-smooth]
     [--debug]
+
+# Re-run NU-MCC densificación en nube cached (sin repetir DA3/SAM2/merge)
+.venv/bin/python3 tools/pipeline_scripts/pipeline_multiview.py \
+    --views-dir data/images/headphones_views/ --name headphones \
+    --skip-da3 --skip-sam2 --skip-merge --use-numcc --udf-threshold 0.15
 ```
 
-**Selección de mejor vista (best_view):** `argmin(centerness_distance_i)` donde `centerness_distance = sqrt((cx_mask - W/2)² + (cy_mask - H/2)²)`. La mask más centrada es la de referencia para el bbox fallback.
+**Selección de mejor vista (best_view):** `argmin(centerness_distance_i)` donde `centerness_distance = sqrt((cx_mask - W/2)² + (cy_mask - H/2)²)`. La mask más centrada es la de referencia para registro ICP (`ref_idx == best_idx` enforced).
 
-**Bbox re-segmentación (Stage 3, siempre para vistas no-best):** para TODAS las vistas no-best, back-project objeto de best_view → proyectar a image_i → re-correr SAM2 con `--bbox`. AMG no se usa para vistas no-best: puede producir masks de área correcta pero contaminadas con el fondo en ángulos difíciles (ej. vista cenital de audífonos — arco delgado deja pasar el fondo). Solo best_view usa AMG. Limitación: si una vista no-best es casi espejo de best_view (ej. izquierdo vs derecho), el bbox proyectado puede tener score SAM2 ~0 y la mask resultante es pequeña → pocos puntos de esa vista en el merge.
+**Registro FPFH+ICP (Stage 3+4 combinado):**
+1. Back-project todas las vistas → nube en frame cámara
+2. Restar centroide de cada nube (object-centric)
+3. Para cada vista no-ref: FPFH global → coarse_T (maneja rotaciones >90°); luego ICP point-to-plane → fine_T
+4. Divergence check: si `inlier_rmse > icp_threshold * 0.5` → usar coarse_T + opcionalmente re-segmentar con bbox
+5. Bbox fallback (solo para vistas con rmse alto): proyectar nube ref a image_i via `transform_i.inverse()` → re-run SAM2 bbox → re-register
+6. Merge: concatenar ref + aligned clouds → voxel downsample → Y-up → merged_cloud.ply
 
-**Coordinate frame:** DA3 entrega extrinsics camera-to-world (`p_world = R @ p_cam + t`). Todos los clouds se transforman al frame de la vista 0. Se aplica rotación Y-up (`[[1,0,0],[0,-1,0],[0,0,-1]]`) al merged cloud antes del remesh.
+**Limitación conocida (vistas espejo):** FPFH puede fallar (`fitness≈0`, warning "Too few correspondences after mutual filter") cuando dos vistas son casi espejo (izquierdo vs derecho). En ese caso ICP con identity fallback puede tener rmse≈0 (0 correspondencias) sin divergence flag → la vista se incluye en posición incorrecta. Se puede mejorar bajando `--icp-threshold` o usando `--registration icp` si las vistas son narrow-baseline.
 
-**SAM2 `--bbox` mode** (nuevo en `submodules/sam2/pipeline.py`): usa `SAM2ImagePredictor.predict(box=..., multimask_output=True)`, selecciona `masks[scores.argmax()]`. Sin `merge_centered_masks`. Activar con `--bbox x1 y1 x2 y2`.
+**Stage 4b NU-MCC densificación (`--use-numcc`):** Opcional. Corre `numcc:x86` con `--query-cloud` apuntando al merged_cloud.ply (bypass del meshgrid interno). Usa la best-view como `seen_xyz`. Output: `04_pointcloud/<nombre>_numcc_surface.ply`. Si NU-MCC no produce output, fallback a merged_cloud.ply para el remesh.
+
+**SAM2 `--bbox` mode** (en `submodules/sam2/pipeline.py`): usa `SAM2ImagePredictor.predict(box=..., multimask_output=True)`, selecciona `masks[scores.argmax()]`. Sin `merge_centered_masks`. Activar con `--bbox x1 y1 x2 y2`.
 
 **Outputs en `output/<nombre>/`:**
-- `01_da3/` — depth_i.npy + intrinsics_i.json + extrinsics.npy + depth_vis_i.png
-- `02_sam2/` — segmask_i.npy + viz_i.png + depth_vis_masked_i.png + best_view_idx.txt
-- `03_clouds/` — *_cloud_i.ply (por vista, world frame) + *_merged_cloud.ply (voxel-downsampled)
+- `01_da3/` — depth_i.npy + intrinsics_i.json + extrinsics.npy (guardado pero no usado para merge)
+- `02_sam2/` — segmask_i.npy + viz_i.png + best_view_idx.txt
+- `03_clouds/` — *_cloud_i.ply (por vista, ref-centroid frame, Y-up) + *_merged_cloud.ply
+- `04_pointcloud/` — *_numcc_surface.ply (solo con --use-numcc)
 - `04_mesh/` — <nombre>.obj + <nombre>_smoothed.obj
 - `pipeline_report.json` + `vram_profile.csv`
 
-**Benchmarks E2E (RTX 4000 Ada, 3 vistas audífonos reales centro+derecho+izquierdo, iou=0.70, stab=0.80, nksr):**
+**Benchmarks E2E v2 (RTX 4000 Ada, 3 vistas headphones_3views/, iou=0.70, stab=0.80, nksr):**
+
+| Stage | Tiempo | VRAM pico |
+|-------|--------|-----------|
+| DA3 multiview | 12.1s | 9,648 MB |
+| SAM2 AMG × 3 | 37.9s | 9,648 MB |
+| Merge v2 (FPFH+ICP) | ~3s | ~1,400 MB |
+| Remesh nksr | 11.9s | 1,823 MB |
+| **Total (sin smooth)** | **~67s** | **9,648 MB** |
+
+- Dataset: `headphones_3views/view_0.jpg` (centro) + `view_1.jpg` (derecho, best) + `view_2.jpg` (izquierdo)
+- best_view = view_1 (centerness=42.3)
+- View 0: FPFH fitness=0.584, ICP rmse=0.0032 ✓ (buena alineación)
+- View 2: FPFH fitness=0.000 (vistas espejo, mutual filter falla), ICP rmse=0.000 (identity fallback)
+- Puntos: view_0=31,407 + view_1=17,389 (ref) + view_2=41,333 → merged 90,129 → 15,528 tras downsample
+- OBJ final: 44,215 vértices, 84,882 caras (nksr)
+- Tests: `tests/multiview/` — 27/27 pasan
+
+**Benchmarks E2E v1 (referencia, DA3 extrinsics, mismos datos):**
 
 | Stage | Tiempo | VRAM pico |
 |-------|--------|-----------|
 | DA3 multiview | 11.8s | 9,730 MB |
-| SAM2 AMG × 3 | 39.3s | 9,730 MB |
-| SAM2 bbox (vistas 0 y 2) | incluido arriba | — |
+| SAM2 AMG × 3 + bbox | 39.3s | 9,730 MB |
 | Merge + voxel | 0.01s | 1,479 MB |
 | Remesh nksr | 13.3s | 1,837 MB |
-| Smooth | 0.4s | 1,484 MB |
-| **Total** | **73.6s** | **9,730 MB** |
+| **Total (sin smooth)** | **~73s** | **9,730 MB** |
 
-- Dataset: `headphones_centro.jpeg` (view_0) + `headphones_derecho.jpeg` (view_1, best) + `headphones_izquierdo.jpeg` (view_2)
-- best_view = view_1 (derecho, centerness=42.3); vistas 0 y 2 re-segmentadas con bbox proyectado desde view_1
-- Puntos por vista: view_0=16,197 (bbox) + view_1=17,389 (AMG) + view_2=3,570 (bbox) → merged 37,156 → tras downsample 5,368 pts
-- OBJ final: 15,614 vértices, 29,878 caras pre-smooth → 11,655 vértices, 22,162 caras suavizado
-- view_2 (izquierdo) da pocos pts: bbox proyectado desde derecho tiene scores ~0 en esa perspectiva — geometría espejo reduce overlap
-- Tests: `tests/multiview/test_utils.py` — 18/18 pasan
+- v1 bug: DA3 extrinsics fallaban para wide-baseline → objeto aparecía en 2+ posiciones en merged cloud
 
 **Nota:** DA3 `da3 images <dir>` (subcommand multiview) produce NPZ con `depth(N,H,W)`, `intrinsics(N,3,3)`, `extrinsics(N,3,4)`. No usar `da3 image img1 img2` (no soportado).
 
