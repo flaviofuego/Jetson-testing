@@ -551,6 +551,108 @@ def stage_sam2_bbox_fallback(
     return updated
 
 
+def stage_merge_clouds(
+    images: list[Path],
+    depths: list[Path],
+    intrinsics: list[Path],
+    extrinsics: np.ndarray,
+    segmask_paths: list[Path | None],
+    name: str,
+    out_dir: Path,
+    voxel_size: float,
+    monitor: VRAMMonitor,
+) -> dict:
+    """
+    Back-project each masked depth, transform to world frame, merge, voxel-downsample.
+    """
+    header("STAGE 4 — Merge point clouds")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    all_pts: list[np.ndarray] = []
+    all_colors: list[np.ndarray] = []
+
+    for i, img in enumerate(images):
+        if segmask_paths[i] is None:
+            print(f"  View {i}: no mask — skipping")
+            continue
+
+        depth_i = np.load(str(depths[i])).astype(np.float32)
+        H_i, W_i = depth_i.shape
+        intri_i  = json.loads(Path(intrinsics[i]).read_text())
+        fx, fy   = intri_i["fx"], intri_i["fy"]
+        cx, cy   = intri_i["cx"], intri_i["cy"]
+        R_i = extrinsics[i, :, :3].astype(np.float32)
+        t_i = extrinsics[i, :, 3].astype(np.float32)
+
+        mask_i = np.load(str(segmask_paths[i])).astype(bool)
+        if mask_i.shape != (H_i, W_i):
+            from PIL import Image as PILImage
+            m_img = PILImage.fromarray(mask_i.astype(np.uint8)*255).resize(
+                (W_i, H_i), PILImage.NEAREST)
+            mask_i = np.asarray(m_img) > 0
+
+        # Back-project masked pixels
+        v_idx, u_idx = np.where((depth_i > 0) & mask_i)
+        if len(v_idx) == 0:
+            print(f"  View {i}: 0 object pts after mask filter — skipping")
+            continue
+        Z = depth_i[v_idx, u_idx]
+        X = (u_idx - cx) * Z / fx
+        Y = (v_idx - cy) * Z / fy
+        pts_cam = np.stack([X, Y, Z], axis=1).astype(np.float32)
+
+        # Transform cam → world frame
+        pts_world = _transform_to_world(pts_cam, R_i, t_i)
+
+        # Sample colors from original image at object pixel locations
+        from PIL import Image as PILImage
+        img_np = np.array(PILImage.open(str(img)).convert("RGB"))
+        cH, cW = img_np.shape[:2]
+        cv = (v_idx * (cH / H_i)).astype(int).clip(0, cH - 1)
+        cu = (u_idx * (cW / W_i)).astype(int).clip(0, cW - 1)
+        colors_i = img_np[cv, cu, :3].astype(np.uint8)
+
+        # Save per-view PLY (Y-up)
+        ply_i = out_dir / f"{name}_cloud_{i}.ply"
+        _save_ply(ply_i, (CAM_TO_YUP @ pts_world.T).T, colors_i)
+        print(f"  View {i}: {len(pts_world):,} pts  → {ply_i.name}")
+
+        all_pts.append(pts_world)
+        all_colors.append(colors_i)
+
+    if not all_pts:
+        sys.exit("No object points from any view — check masks and depth alignment")
+
+    merged_pts    = np.concatenate(all_pts, axis=0)
+    merged_colors = np.concatenate(all_colors, axis=0)
+    print(f"\n  Before downsample: {len(merged_pts):,} pts")
+
+    # Voxel downsample (numpy fallback — Open3D not available in venv)
+    t0 = time.time()
+    down_pts, down_colors = _voxel_downsample(merged_pts, merged_colors, voxel_size)
+    print(f"  After downsample ({voxel_size}m voxels): {len(down_pts):,} pts  "
+          f"({time.time()-t0:.2f}s)")
+
+    if len(down_pts) < 100:
+        sys.exit(f"Merged cloud has only {len(down_pts)} pts — insufficient coverage")
+
+    # Apply Y-up rotation for viewer/Drake convention
+    down_pts_yup = (CAM_TO_YUP @ down_pts.T).T
+
+    merged_ply = out_dir / f"{name}_merged_cloud.ply"
+    _save_ply(merged_ply, down_pts_yup, down_colors)
+    print(f"  Saved: {merged_ply}")
+
+    t1 = time.time()
+    peak = monitor.peak_mb(t0, t1)
+    return {
+        "merged_ply": merged_ply,
+        "n_pts_before": len(merged_pts),
+        "n_pts_after":  len(down_pts),
+        "t0": t0, "t1": t1, "peak_mb": peak,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Multiview pipeline: image directory → OBJ mesh",
@@ -661,7 +763,23 @@ def main():
             segmask_paths = sam2_result["segmask_paths"]
         best_idx = sam2_result["best_idx"]
 
-        print("\n  [stub] Stages 4-6 not yet implemented")
+        # [4] Merge
+        if args.skip_merge:
+            merged_ply = dir_clouds / f"{args.name}_merged_cloud.ply"
+            if not merged_ply.exists():
+                sys.exit(f"--skip-merge: {merged_ply} not found")
+            print(f"\n[--skip-merge] Using {merged_ply}")
+            merge_result = {"merged_ply": merged_ply, "t0": 0, "t1": 0, "peak_mb": 0}
+        else:
+            merge_result = stage_merge_clouds(
+                images, da3_result["depths"], da3_result["intrinsics"],
+                da3_result["extrinsics"], segmask_paths,
+                args.name, dir_clouds, args.voxel_size, monitor,
+            )
+            stages["merge"] = merge_result
+        merged_ply = merge_result["merged_ply"]
+
+        print("\n  [stub] Stages 5-6 not yet implemented")
 
     except subprocess.CalledProcessError as e:
         print(f"\nPipeline failed (exit {e.returncode})", file=sys.stderr)
