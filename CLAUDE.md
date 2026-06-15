@@ -183,6 +183,46 @@ xhost +local:docker
 **Output:** mismo formato que `pipeline.py` — `<name>.png` (fondo blanco) + `<name>_segmask.npy` (uint8) + `<name>_viz.png`.
 Compatible con `--skip-sam2` en `tools/pipeline.py` copiando los outputs a `output/<name>/02_sam2/`.
 
+### SAM2 — pipeline automático YOLO + SAM2
+
+Para segmentación sin tunear thresholds AMG. YOLO detecta el bbox, SAM2 segmenta con precisión.
+
+```bash
+# Objeto en COCO80 (taza, botella, silla, etc.)
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/taza/taza.jpeg \
+  --output data/outputs \
+  --name taza \
+  --class-name cup
+
+# Objeto no en COCO80 (taladro, audífonos) — usar clase más alta confianza
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/taladro.JPG \
+  --output data/outputs \
+  --name taladro \
+  --any-class
+
+# Escena multi-objeto — elegir interactivamente con click
+xhost +local:docker
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/escena.jpg \
+  --output data/outputs \
+  --name objeto \
+  --interactive
+```
+
+**Flags de selección (uno requerido):**
+- `--class-name cup` → filtrar por nombre de clase COCO
+- `--class-id 41` → filtrar por ID de clase COCO
+- `--any-class` → detección de mayor confianza sin filtro
+- `--interactive` → mostrar todas las detecciones, click para elegir (requiere X11)
+
+**COCO80 clases relevantes:** cup=41, bottle=39, chair=56, laptop=63, cell phone=67.
+**Taladro y audífonos NO están en COCO80** → usar `--any-class` o `--interactive`.
+
+**Output:** mismo formato que `pipeline.py` — `<name>.png` + `<name>_segmask.npy` + `<name>_viz.png` (viz incluye bbox YOLO en amarillo).
+**Modelos YOLO:** `yolo11n.pt` (default, 6 MB) — se descarga automáticamente en `~/models/yolo/` la primera vez.
+
 ### TripoSR — generar asset
 ```bash
 # Descargar modelos (una sola vez)
