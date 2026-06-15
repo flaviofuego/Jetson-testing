@@ -59,7 +59,7 @@ import numpy as np
 
 # ─── Paths ────────────────────────────────────────────────────────────────────
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 DA3_CLI      = Path("/home/worker-node-4/Documents/GitHub/UniWhere/.venv/bin/da3")
 MODELS_NUMCC = Path.home() / "models" / "numcc"
 MODELS_SAM2  = Path.home() / "models" / "sam2"

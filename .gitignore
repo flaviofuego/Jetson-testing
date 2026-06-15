@@ -32,3 +32,8 @@ tools/download_models_trellis_windows.py
 data/outputs/**
 .claude/**
 /data/aira_input_data
+/output
+/data/images
+/data/images
+/data/images
+/data/images/headphones_3views
