@@ -131,6 +131,101 @@ def _save_ply(path: Path, pts: np.ndarray, colors: np.ndarray | None = None):
         f.write(data.tobytes())
 
 
+def _fpfh_register(
+    src_pts: np.ndarray,
+    tgt_pts: np.ndarray,
+    voxel_size: float,
+) -> tuple[np.ndarray, float]:
+    """FPFH global registration. Returns (4x4 transform, fitness)."""
+    import open3d as o3d
+
+    def _to_pcd(pts):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+        return pcd
+
+    def _preprocess(pcd, vs):
+        ds = pcd.voxel_down_sample(vs)
+        ds.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 2, max_nn=30))
+        feat = o3d.pipelines.registration.compute_fpfh_feature(
+            ds, o3d.geometry.KDTreeSearchParamHybrid(radius=vs * 5, max_nn=100))
+        return ds, feat
+
+    src_pcd, src_feat = _preprocess(_to_pcd(src_pts), voxel_size)
+    tgt_pcd, tgt_feat = _preprocess(_to_pcd(tgt_pts), voxel_size)
+
+    result = o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        src_pcd, tgt_pcd, src_feat, tgt_feat,
+        mutual_filter=True,
+        max_correspondence_distance=voxel_size * 1.5,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(False),
+        ransac_n=4,
+        checkers=[
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+            o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(voxel_size * 1.5),
+        ],
+        criteria=o3d.pipelines.registration.RANSACConvergenceCriteria(4_000_000, 500),
+    )
+    T = np.asarray(result.transformation)
+    return T, float(result.fitness)
+
+
+def _icp_refine(
+    src_pts: np.ndarray,
+    tgt_pts: np.ndarray,
+    init_T: np.ndarray,
+    threshold: float,
+) -> tuple[np.ndarray, float]:
+    """ICP point-to-plane refinement. Returns (4x4 transform, inlier_rmse)."""
+    import open3d as o3d
+
+    def _to_pcd_with_normals(pts):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+        pcd.estimate_normals(o3d.geometry.KDTreeSearchParamHybrid(radius=threshold * 2, max_nn=30))
+        return pcd
+
+    src_pcd = _to_pcd_with_normals(src_pts)
+    tgt_pcd = _to_pcd_with_normals(tgt_pts)
+
+    result = o3d.pipelines.registration.registration_icp(
+        src_pcd, tgt_pcd,
+        max_correspondence_distance=threshold,
+        init=init_T,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        criteria=o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=50),
+    )
+    T = np.asarray(result.transformation)
+    return T, float(result.inlier_rmse)
+
+
+def _project_bbox_from_icp(
+    pts_centered_ref: np.ndarray,
+    transform_i: np.ndarray,
+    centroid_i: np.ndarray,
+    fx_i: float, fy_i: float,
+    cx_i: float, cy_i: float,
+    H_i: int, W_i: int,
+    margin: int = 20,
+) -> list[int]:
+    """Project ref-view object cloud into camera_i image plane via ICP inverse transform."""
+    R_inv = transform_i[:3, :3].T
+    t_inv = -R_inv @ transform_i[:3, 3]
+    pts_cam_i_centred = (R_inv @ pts_centered_ref.T).T + t_inv
+    pts_cam_i = pts_cam_i_centred + centroid_i.astype(np.float64)
+    valid = pts_cam_i[:, 2] > 0.01
+    if not valid.any():
+        return [0, 0, W_i, H_i]
+    pts_cam_i = pts_cam_i[valid]
+    u = pts_cam_i[:, 0] / pts_cam_i[:, 2] * fx_i + cx_i
+    v = pts_cam_i[:, 1] / pts_cam_i[:, 2] * fy_i + cy_i
+    x1 = max(0, int(u.min()) - margin)
+    y1 = max(0, int(v.min()) - margin)
+    x2 = min(W_i, int(u.max()) + margin)
+    y2 = min(H_i, int(v.max()) + margin)
+    return [x1, y1, x2, y2]
+
+
 # ─── VRAM Monitor ─────────────────────────────────────────────────────────────
 
 class VRAMMonitor:
@@ -444,7 +539,7 @@ def stage_sam2_all(
     }
 
 
-def stage_sam2_bbox_fallback(
+def stage_merge_v2(
     images: list[Path],
     name: str,
     sam2_dir: Path,
@@ -452,190 +547,209 @@ def stage_sam2_bbox_fallback(
     best_idx: int,
     depths: list[Path],
     intrinsics: list[Path],
-    extrinsics: np.ndarray,
-    monitor: VRAMMonitor,
-    sam2_model: str = "small",
-) -> list[Path | None]:
-    """
-    For all non-best views, re-run SAM2 with a bbox prompt derived from the best-view 3D cloud.
-    Always applied (not conditional on area_ratio) — AMG can produce correct-sized but
-    scene-contaminated masks on difficult angles (e.g. top-view of headphones).
-    Returns updated segmask_paths list.
-    """
-    header("STAGE 3 — SAM2 bbox re-segmentation (all non-best views)")
-
-    best_mask_path = segmask_paths[best_idx]
-    if best_mask_path is None:
-        print("  Best view has no mask — skipping bbox fallback")
-        return segmask_paths
-
-    mask_best = np.load(str(best_mask_path)).astype(np.uint8)
-    depth_best = np.load(str(depths[best_idx])).astype(np.float32)
-    intri_best = json.loads(Path(intrinsics[best_idx]).read_text())
-    fx_b, fy_b = intri_best["fx"], intri_best["fy"]
-    cx_b, cy_b = intri_best["cx"], intri_best["cy"]
-    R_best = extrinsics[best_idx, :, :3]
-    t_best = extrinsics[best_idx, :, 3]
-
-    # Back-project best view depth filtered by mask → world frame
-    H_b, W_b = depth_best.shape
-    m_best_resized = mask_best
-    if mask_best.shape != (H_b, W_b):
-        from PIL import Image as PILImage
-        m_img = PILImage.fromarray(mask_best*255).resize((W_b, H_b), PILImage.NEAREST)
-        m_best_resized = (np.asarray(m_img) > 0).astype(np.uint8)
-
-    # Simple inline back-projection
-    v_idx, u_idx = np.where((depth_best > 0) & (m_best_resized > 0))
-    Z = depth_best[v_idx, u_idx]
-    X = (u_idx - cx_b) * Z / fx_b
-    Y = (v_idx - cy_b) * Z / fy_b
-    pts_cam_best = np.stack([X, Y, Z], axis=1).astype(np.float32)
-    pts_world = _transform_to_world(pts_cam_best, R_best, t_best)
-
-    updated = list(segmask_paths)
-    any_fallback = False
-
-    for i, img in enumerate(images):
-        if i == best_idx or segmask_paths[i] is None:
-            continue
-
-        print(f"  View {i}: re-segmenting with bbox from best_view ({best_idx})")
-        any_fallback = True
-
-        intri_i = json.loads(Path(intrinsics[i]).read_text())
-        fx_i, fy_i = intri_i["fx"], intri_i["fy"]
-        cx_i, cy_i = intri_i["cx"], intri_i["cy"]
-        R_i = extrinsics[i, :, :3]
-        t_i = extrinsics[i, :, 3]
-        depth_i = np.load(str(depths[i]))
-        H_i, W_i = depth_i.shape
-
-        bbox = _project_to_bbox(pts_world, R_i, t_i, fx_i, fy_i, cx_i, cy_i, H_i, W_i)
-        print(f"    projected bbox: {bbox}")
-
-        view_out = sam2_dir / f"view_{i}_bbox"
-        view_out.mkdir(exist_ok=True)
-        cmd = [
-            "docker", "run", "--rm", "--gpus", "all",
-            "-v", f"{img.resolve().parent}:/input:ro",
-            "-v", f"{view_out.resolve()}:/output",
-            "-v", f"{MODELS_SAM2}:/opt/sam2/checkpoints:ro",
-            "-v", f"{PROJECT_ROOT / 'submodules' / 'sam2' / 'pipeline.py'}:/opt/sam2/pipeline.py:ro",
-            "--entrypoint", "python3",
-            DOCKER_SAM2,
-            "/opt/sam2/pipeline.py",
-            "--input",  f"/input/{img.name}",
-            "--output", "/output",
-            "--name",   f"{name}_{i}",
-            "--model",  sam2_model,
-            "--bbox",   str(bbox[0]), str(bbox[1]), str(bbox[2]), str(bbox[3]),
-        ]
-        run(cmd)
-
-        new_mask = view_out / f"{name}_{i}_segmask.npy"
-        if new_mask.exists():
-            dst = sam2_dir / f"{name}_segmask_{i}.npy"
-            shutil.move(str(new_mask), str(dst))
-            updated[i] = dst
-            m_new = np.load(str(dst))
-            print(f"    bbox mask: sum={m_new.sum()}")
-        shutil.rmtree(str(view_out), ignore_errors=True)
-
-    if not any_fallback:
-        print("  Only one view — no re-segmentation needed")
-
-    return updated
-
-
-def stage_merge_clouds(
-    images: list[Path],
-    depths: list[Path],
-    intrinsics: list[Path],
-    extrinsics: np.ndarray,
-    segmask_paths: list[Path | None],
-    name: str,
     out_dir: Path,
     voxel_size: float,
-    monitor: VRAMMonitor,
+    monitor: "VRAMMonitor",
+    sam2_model: str = "small",
+    registration: str = "fpfh",
+    icp_threshold: float = 0.02,
+    skip_sam2_bbox: bool = False,
 ) -> dict:
     """
-    Back-project each masked depth, transform to world frame, merge, voxel-downsample.
+    Combined Stage 3+4: back-project all views, FPFH+ICP register to ref (best_idx),
+    optional SAM2 bbox re-segmentation for poorly-aligned views, merge + voxel downsample.
     """
-    header("STAGE 4 — Merge point clouds")
+    header("STAGE 3+4 — Merge v2  (FPFH+ICP registration)")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    all_pts: list[np.ndarray] = []
-    all_colors: list[np.ndarray] = []
+    def _back_project(depth_path, mask_path, intri_path, img_path):
+        depth = np.load(str(depth_path)).astype(np.float32)
+        H, W = depth.shape
+        intri = json.loads(Path(intri_path).read_text())
+        fx, fy, cx, cy = intri["fx"], intri["fy"], intri["cx"], intri["cy"]
 
-    for i, img in enumerate(images):
-        if segmask_paths[i] is None:
-            print(f"  View {i}: no mask — skipping")
-            continue
-
-        depth_i = np.load(str(depths[i])).astype(np.float32)
-        H_i, W_i = depth_i.shape
-        intri_i  = json.loads(Path(intrinsics[i]).read_text())
-        fx, fy   = intri_i["fx"], intri_i["fy"]
-        cx, cy   = intri_i["cx"], intri_i["cy"]
-        R_i = extrinsics[i, :, :3].astype(np.float32)
-        t_i = extrinsics[i, :, 3].astype(np.float32)
-
-        mask_i = np.load(str(segmask_paths[i])).astype(bool)
-        if mask_i.shape != (H_i, W_i):
+        raw_mask = np.load(str(mask_path)).astype(np.uint8)
+        if raw_mask.shape != (H, W):
             from PIL import Image as PILImage
-            m_img = PILImage.fromarray(mask_i.astype(np.uint8)*255).resize(
-                (W_i, H_i), PILImage.NEAREST)
-            mask_i = np.asarray(m_img) > 0
+            m_img = PILImage.fromarray(raw_mask * 255).resize((W, H), PILImage.NEAREST)
+            raw_mask = (np.asarray(m_img) > 0).astype(np.uint8)
 
-        # Back-project masked pixels
-        v_idx, u_idx = np.where((depth_i > 0) & mask_i)
+        v_idx, u_idx = np.where((depth > 0) & (raw_mask > 0))
         if len(v_idx) == 0:
-            print(f"  View {i}: 0 object pts after mask filter — skipping")
-            continue
-        Z = depth_i[v_idx, u_idx]
+            return None, None, None, intri, H, W
+
+        Z = depth[v_idx, u_idx]
         X = (u_idx - cx) * Z / fx
         Y = (v_idx - cy) * Z / fy
         pts_cam = np.stack([X, Y, Z], axis=1).astype(np.float32)
 
-        # Transform cam → world frame
-        pts_world = _transform_to_world(pts_cam, R_i, t_i)
+        colors = None
+        if img_path is not None and Path(img_path).exists():
+            from PIL import Image as PILImage
+            img_np = np.array(PILImage.open(str(img_path)).convert("RGB"))
+            cH, cW = img_np.shape[:2]
+            cv = (v_idx * (cH / H)).astype(int).clip(0, cH - 1)
+            cu = (u_idx * (cW / W)).astype(int).clip(0, cW - 1)
+            colors = img_np[cv, cu, :3].astype(np.uint8)
 
-        # Sample colors from original image at object pixel locations
-        from PIL import Image as PILImage
-        img_np = np.array(PILImage.open(str(img)).convert("RGB"))
-        cH, cW = img_np.shape[:2]
-        cv = (v_idx * (cH / H_i)).astype(int).clip(0, cH - 1)
-        cu = (u_idx * (cW / W_i)).astype(int).clip(0, cW - 1)
-        colors_i = img_np[cv, cu, :3].astype(np.uint8)
+        return pts_cam, colors, np.mean(pts_cam, axis=0), intri, H, W
 
-        # Save per-view PLY (Y-up)
+    # ── 3a: back-project all views ─────────────────────────────────────────────
+    view_pts    = {}
+    view_colors = {}
+    centroids   = {}
+    view_intri  = {}
+    view_hw     = {}
+
+    for i, img in enumerate(images):
+        mask_path = segmask_paths[i] if i < len(segmask_paths) else None
+        if mask_path is None:
+            print(f"  View {i}: no mask — skipping")
+            continue
+        pts, colors, centroid, intri, H, W = _back_project(
+            depths[i], mask_path, intrinsics[i], img)
+        if pts is None:
+            print(f"  View {i}: 0 object pts — skipping")
+            continue
+        view_pts[i]    = pts
+        view_colors[i] = colors
+        centroids[i]   = centroid
+        view_intri[i]  = intri
+        view_hw[i]     = (H, W)
+        print(f"  View {i}: {len(pts):,} pts  centroid={centroid.round(3)}")
+
+    if best_idx not in view_pts:
+        sys.exit(f"Best view {best_idx} has no valid object pts — cannot register")
+
+    # ── 3b: register each non-ref view to ref ─────────────────────────────────
+    ref_idx = best_idx
+    pts_ref  = view_pts[ref_idx]
+    c_ref    = centroids[ref_idx]
+    pts_centered_ref = pts_ref - c_ref
+
+    transforms = {}
+    rmse_vals   = {}
+
+    for i in sorted(view_pts.keys()):
+        if i == ref_idx:
+            continue
+        pts_i      = view_pts[i]
+        c_i        = centroids[i]
+        pts_cent_i = pts_i - c_i
+
+        print(f"\n  View {i}: registering to ref ({ref_idx}) ...")
+        if registration == "fpfh":
+            coarse_T, fitness = _fpfh_register(pts_cent_i, pts_centered_ref, voxel_size)
+            if fitness < 0.05:
+                print(f"    FPFH fitness={fitness:.3f} — very low, using identity as init")
+                coarse_T = np.eye(4)
+            else:
+                print(f"    FPFH fitness={fitness:.3f}")
+        else:
+            coarse_T = np.eye(4, dtype=np.float64)
+            fitness  = 1.0
+
+        fine_T, rmse = _icp_refine(pts_cent_i, pts_centered_ref, coarse_T, icp_threshold)
+        print(f"    ICP rmse={rmse:.4f}  (threshold={icp_threshold})")
+
+        if rmse > icp_threshold * 0.5:
+            print(f"    [WARN] ICP inlier_rmse {rmse:.4f} > {icp_threshold*0.5:.4f} "
+                  f"— falling back to coarse FPFH transform")
+            final_T = coarse_T
+        else:
+            final_T = fine_T
+
+        transforms[i] = final_T
+        rmse_vals[i]  = rmse
+
+    # ── 3c: bbox fallback for poorly aligned views ─────────────────────────────
+    if not skip_sam2_bbox:
+        for i in sorted(transforms.keys()):
+            rmse = rmse_vals[i]
+            if rmse <= icp_threshold * 0.5:
+                continue
+            print(f"\n  View {i}: rmse={rmse:.4f} > threshold — re-segmenting with bbox")
+            intri_i = view_intri[i]
+            H_i, W_i = view_hw[i]
+            bbox = _project_bbox_from_icp(
+                pts_centered_ref, transforms[i], centroids[i],
+                intri_i["fx"], intri_i["fy"], intri_i["cx"], intri_i["cy"],
+                H_i, W_i,
+            )
+            print(f"    projected bbox: {bbox}")
+            view_out = sam2_dir / f"view_{i}_bbox_v2"
+            view_out.mkdir(exist_ok=True)
+            cmd = [
+                "docker", "run", "--rm", "--gpus", "all",
+                "-v", f"{images[i].resolve().parent}:/input:ro",
+                "-v", f"{view_out.resolve()}:/output",
+                "-v", f"{MODELS_SAM2}:/opt/sam2/checkpoints:ro",
+                "-v", f"{PROJECT_ROOT / 'submodules' / 'sam2' / 'pipeline.py'}:/opt/sam2/pipeline.py:ro",
+                "--entrypoint", "python3",
+                DOCKER_SAM2,
+                "/opt/sam2/pipeline.py",
+                "--input",  f"/input/{images[i].name}",
+                "--output", "/output",
+                "--name",   f"{name}_{i}",
+                "--model",  sam2_model,
+                "--bbox",   str(bbox[0]), str(bbox[1]), str(bbox[2]), str(bbox[3]),
+            ]
+            run(cmd)
+            new_mask = view_out / f"{name}_{i}_segmask.npy"
+            if new_mask.exists():
+                dst = sam2_dir / f"{name}_segmask_{i}.npy"
+                shutil.move(str(new_mask), str(dst))
+                segmask_paths[i] = dst
+                pts_new, colors_new, centroid_new, _, _, _ = _back_project(
+                    depths[i], dst, intrinsics[i], images[i])
+                if pts_new is not None:
+                    view_pts[i]    = pts_new
+                    view_colors[i] = colors_new
+                    centroids[i]   = centroid_new
+                    pts_cent_new = pts_new - centroid_new
+                    if registration == "fpfh":
+                        coarse_T2, _ = _fpfh_register(pts_cent_new, pts_centered_ref, voxel_size)
+                    else:
+                        coarse_T2 = np.eye(4, dtype=np.float64)
+                    fine_T2, rmse2 = _icp_refine(pts_cent_new, pts_centered_ref, coarse_T2, icp_threshold)
+                    transforms[i] = fine_T2 if rmse2 <= icp_threshold * 0.5 else coarse_T2
+                    print(f"    After bbox: rmse={rmse2:.4f}")
+            shutil.rmtree(str(view_out), ignore_errors=True)
+
+    # ── 3e: merge + voxel downsample ──────────────────────────────────────────
+    all_pts    = [pts_centered_ref]
+    all_colors = [view_colors.get(ref_idx)]
+
+    ply_ref = out_dir / f"{name}_cloud_{ref_idx}.ply"
+    _save_ply(ply_ref, (CAM_TO_YUP @ pts_centered_ref.T).T, view_colors.get(ref_idx))
+
+    for i in sorted(transforms.keys()):
+        T = transforms[i]
+        R, t = T[:3, :3], T[:3, 3]
+        pts_cent_i = view_pts[i] - centroids[i]
+        pts_aligned = (R @ pts_cent_i.T).T + t
+
         ply_i = out_dir / f"{name}_cloud_{i}.ply"
-        _save_ply(ply_i, (CAM_TO_YUP @ pts_world.T).T, colors_i)
-        print(f"  View {i}: {len(pts_world):,} pts  → {ply_i.name}")
+        _save_ply(ply_i, (CAM_TO_YUP @ pts_aligned.T).T, view_colors.get(i))
+        print(f"  View {i}: {len(pts_aligned):,} pts aligned → {ply_i.name}")
+        all_pts.append(pts_aligned)
+        if view_colors.get(i) is not None:
+            all_colors.append(view_colors[i])
 
-        all_pts.append(pts_world)
-        all_colors.append(colors_i)
+    merged_pts = np.concatenate(all_pts, axis=0)
+    merged_colors = (np.concatenate([c for c in all_colors if c is not None], axis=0)
+                     if any(c is not None for c in all_colors)
+                     else np.zeros((len(merged_pts), 3), dtype=np.uint8))
 
-    if not all_pts:
-        sys.exit("No object points from any view — check masks and depth alignment")
-
-    merged_pts    = np.concatenate(all_pts, axis=0)
-    merged_colors = np.concatenate(all_colors, axis=0)
     print(f"\n  Before downsample: {len(merged_pts):,} pts")
-
-    # Voxel downsample (numpy fallback — Open3D not available in venv)
     t0 = time.time()
     down_pts, down_colors = _voxel_downsample(merged_pts, merged_colors, voxel_size)
-    print(f"  After downsample ({voxel_size}m voxels): {len(down_pts):,} pts  "
-          f"({time.time()-t0:.2f}s)")
+    print(f"  After downsample ({voxel_size}m voxels): {len(down_pts):,} pts  ({time.time()-t0:.2f}s)")
 
     if len(down_pts) < 100:
         sys.exit(f"Merged cloud has only {len(down_pts)} pts — insufficient coverage")
 
-    # Apply Y-up rotation for viewer/Drake convention
     down_pts_yup = (CAM_TO_YUP @ down_pts.T).T
-
     merged_ply = out_dir / f"{name}_merged_cloud.ply"
     _save_ply(merged_ply, down_pts_yup, down_colors)
     print(f"  Saved: {merged_ply}")
@@ -753,6 +867,14 @@ def main():
     ap.add_argument("--skip-merge",  action="store_true")
     ap.add_argument("--skip-smooth", action="store_true")
     ap.add_argument("--debug",       action="store_true")
+    ap.add_argument("--registration", default="fpfh", choices=["fpfh", "icp"],
+                    help="Point cloud registration method (default: fpfh)")
+    ap.add_argument("--icp-threshold", type=float, default=0.02,
+                    help="ICP max correspondence distance in metres (default: 0.02)")
+    ap.add_argument("--use-numcc",     action="store_true",
+                    help="Stage 4b: run NU-MCC densification on merged cloud (--query-cloud)")
+    ap.add_argument("--udf-threshold", type=float, default=0.23,
+                    help="NU-MCC UDF surface threshold (default: 0.23, only with --use-numcc)")
     args = ap.parse_args()
 
     # Collect and validate images
@@ -826,23 +948,7 @@ def main():
             sam2_result["t1"] = time.time()
             stages["SAM2"] = sam2_result
 
-        # [3] bbox fallback (runs if neither --skip-sam2 stage lock nor --skip-merge requested)
-        if not args.skip_merge:
-            segmask_paths = stage_sam2_bbox_fallback(
-                images, args.name, dir_sam2,
-                sam2_result["segmask_paths"],
-                sam2_result["best_idx"],
-                da3_result["depths"],
-                da3_result["intrinsics"],
-                da3_result["extrinsics"],
-                monitor,
-                sam2_model=args.sam2_model,
-            )
-        else:
-            segmask_paths = sam2_result["segmask_paths"]
-        best_idx = sam2_result["best_idx"]
-
-        # [4] Merge
+        # [3+4] Merge v2 (FPFH+ICP, subsumes bbox fallback)
         if args.skip_merge:
             merged_ply = dir_clouds / f"{args.name}_merged_cloud.ply"
             if not merged_ply.exists():
@@ -850,16 +956,47 @@ def main():
             print(f"\n[--skip-merge] Using {merged_ply}")
             merge_result = {"merged_ply": merged_ply, "t0": 0, "t1": 0, "peak_mb": 0}
         else:
-            merge_result = stage_merge_clouds(
-                images, da3_result["depths"], da3_result["intrinsics"],
-                da3_result["extrinsics"], segmask_paths,
-                args.name, dir_clouds, args.voxel_size, monitor,
+            merge_result = stage_merge_v2(
+                images=images,
+                name=args.name,
+                sam2_dir=dir_sam2,
+                segmask_paths=list(sam2_result["segmask_paths"]),
+                best_idx=sam2_result["best_idx"],
+                depths=da3_result["depths"],
+                intrinsics=da3_result["intrinsics"],
+                out_dir=dir_clouds,
+                voxel_size=args.voxel_size,
+                monitor=monitor,
+                sam2_model=args.sam2_model,
+                registration=args.registration,
+                icp_threshold=args.icp_threshold,
             )
             stages["merge"] = merge_result
         merged_ply = merge_result["merged_ply"]
+        best_idx = sam2_result["best_idx"]
+
+        # [4b] NU-MCC densification (optional, independent of --skip-merge)
+        remesh_input = merged_ply
+        if args.use_numcc:
+            densify_result = stage_numcc_densify(
+                merged_ply=merged_ply,
+                best_idx=best_idx,
+                sam2_dir=dir_sam2,
+                da3_dir=dir_da3,
+                name=args.name,
+                out_dir=dir_clouds,
+                monitor=monitor,
+                udf_threshold=args.udf_threshold,
+                mesh_method=args.mesh_method,
+            )
+            stages["numcc_densification"] = densify_result
+            if densify_result["surface_ply"] is not None:
+                remesh_input = densify_result["surface_ply"]
+            else:
+                print("  [WARN] Using merged_cloud.ply for remesh (NU-MCC produced no output)")
 
         # [5] Remesh
-        result = stage_remesh(merged_ply, args.name, dir_mesh,
+        result = stage_remesh(remesh_input, args.name, dir_mesh,
                               args.mesh_method, monitor)
         stages["remesh"] = result
         obj_path = result["obj_path"]
