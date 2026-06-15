@@ -20,6 +20,7 @@ dev = [
     "trimesh",
     "Pillow",
     "numpy",
+    "open3d",
 ]
 
 [tool.uv]
