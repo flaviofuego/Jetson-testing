@@ -376,7 +376,7 @@ Script `tools/pipeline_scripts/pipeline_multiview.py` — recibe directorio con 
 
 **Selección de mejor vista (best_view):** `argmin(centerness_distance_i)` donde `centerness_distance = sqrt((cx_mask - W/2)² + (cy_mask - H/2)²)`. La mask más centrada es la de referencia para el bbox fallback.
 
-**Bbox fallback:** si `area_ratio_i = mask_i.sum() / mask_best.sum() ∉ [0.25, 4.0]`, back-project objeto de best_view → proyectar a image_i → re-correr SAM2 con `--bbox`. Referencia = best_view (no mediana) para evitar que mask mala sesgue el denominador.
+**Bbox re-segmentación (Stage 3, siempre):** para TODAS las vistas no-best, back-project objeto de best_view → proyectar a image_i → re-correr SAM2 con `--bbox`. AMG no se usa para vistas no-best: puede producir masks de área correcta pero contaminadas con el fondo en ángulos difíciles (ej. vista cenital de audífonos — arco delgado deja pasar el fondo). Solo best_view usa AMG.
 
 **Coordinate frame:** DA3 entrega extrinsics camera-to-world (`p_world = R @ p_cam + t`). Todos los clouds se transforman al frame de la vista 0. Se aplica rotación Y-up (`[[1,0,0],[0,-1,0],[0,0,-1]]`) al merged cloud antes del remesh.
 

@@ -457,11 +457,12 @@ def stage_sam2_bbox_fallback(
     sam2_model: str = "small",
 ) -> list[Path | None]:
     """
-    For views where AMG produced a poor mask (area_ratio outside [0.25, 4.0] vs best view),
-    re-run SAM2 with a bbox prompt derived from the best-view 3D cloud.
+    For all non-best views, re-run SAM2 with a bbox prompt derived from the best-view 3D cloud.
+    Always applied (not conditional on area_ratio) — AMG can produce correct-sized but
+    scene-contaminated masks on difficult angles (e.g. top-view of headphones).
     Returns updated segmask_paths list.
     """
-    header("STAGE 3 — SAM2 bbox fallback for poor masks")
+    header("STAGE 3 — SAM2 bbox re-segmentation (all non-best views)")
 
     best_mask_path = segmask_paths[best_idx]
     if best_mask_path is None:
@@ -498,12 +499,8 @@ def stage_sam2_bbox_fallback(
     for i, img in enumerate(images):
         if i == best_idx or segmask_paths[i] is None:
             continue
-        mask_i = np.load(str(segmask_paths[i])).astype(np.uint8)
-        if _area_ratio_ok(mask_i, mask_best):
-            print(f"  View {i}: mask OK (area_ratio in range)")
-            continue
 
-        print(f"  View {i}: mask poor → running SAM2 bbox prompt")
+        print(f"  View {i}: re-segmenting with bbox from best_view ({best_idx})")
         any_fallback = True
 
         intri_i = json.loads(Path(intrinsics[i]).read_text())
@@ -546,7 +543,7 @@ def stage_sam2_bbox_fallback(
         shutil.rmtree(str(view_out), ignore_errors=True)
 
     if not any_fallback:
-        print("  All masks passed quality check — no fallback needed")
+        print("  Only one view — no re-segmentation needed")
 
     return updated
 
