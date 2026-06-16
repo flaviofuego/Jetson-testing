@@ -187,6 +187,8 @@ Compatible con `--skip-sam2` en `tools/pipeline.py` copiando los outputs a `outp
 
 Para segmentación sin tunear thresholds AMG. YOLO detecta el bbox, SAM2 segmenta con precisión.
 
+**Por qué YOLO + SAM2:** SAM2 sin prompt (AMG) genera ~1024 masks candidatas y no sabe qué objeto quieres → hay que tunear thresholds por objeto. YOLO detecta el bbox del objeto → se pasa como prompt a `SAM2ImagePredictor` → SAM2 segmenta solo dentro de esa región, sin tunear nada. YOLO localiza, SAM2 recorta con precisión de píxel.
+
 ```bash
 # Objeto en COCO80 (taza, botella, silla, etc.)
 .venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
@@ -202,13 +204,27 @@ Para segmentación sin tunear thresholds AMG. YOLO detecta el bbox, SAM2 segment
   --name taladro \
   --any-class
 
+# Objeto no en COCO80 con conf baja — bajar threshold
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/taladro.JPG \
+  --output data/outputs \
+  --name taladro \
+  --any-class --conf 0.10
+
 # Escena multi-objeto — elegir interactivamente con click
 xhost +local:docker
 .venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
   --input data/images/escena.jpg \
   --output data/outputs \
   --name objeto \
-  --interactive
+  --interactive --conf 0.10
+
+# Objeto con cavidades huecas en superficie (earpads, foam) — rellenar huecos
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/headphones/headphones_centro.jpeg \
+  --output data/outputs \
+  --name headphones \
+  --any-class --fill-holes
 ```
 
 **Flags de selección (uno requerido):**
@@ -217,11 +233,17 @@ xhost +local:docker
 - `--any-class` → detección de mayor confianza sin filtro
 - `--interactive` → mostrar todas las detecciones, click para elegir (requiere X11)
 
+**Flags opcionales:**
+- `--conf 0.10` → bajar threshold si YOLO no detecta nada a 0.25 (default). Objetos fuera de COCO80 suelen tener conf baja.
+- `--fill-holes` → rellena huecos cerrados de 500–20K px² en la mask. Usar para objetos con cavidades en la superficie (earpads). **No usar** para objetos con agujeros reales (asa de taza, tornillos).
+
 **COCO80 clases relevantes:** cup=41, bottle=39, chair=56, laptop=63, cell phone=67.
-**Taladro y audífonos NO están en COCO80** → usar `--any-class` o `--interactive`.
+**Taladro, audífonos, destornillador NO están en COCO80** → usar `--any-class --conf 0.10` o `--interactive --conf 0.10`.
+
+**`--fill-holes` detalle:** `binary_fill_holes` sobre la mask completa rellena también el espacio abierto entre regiones (ej. espacio entre las dos copas de audífonos ~77K px²). El pipeline detecta huecos por componente y solo rellena los que están en el rango 500–20K px² → preserva espacios abiertos grandes.
 
 **Output:** mismo formato que `pipeline.py` — `<name>.png` + `<name>_segmask.npy` + `<name>_viz.png` (viz incluye bbox YOLO en amarillo).
-**Modelos YOLO:** `yolo11n.pt` (default, 6 MB) — se descarga automáticamente en `~/models/yolo/` la primera vez.
+**Modelos YOLO:** `yolo11n.pt` (default, 6 MB) — se descarga a `~/models/yolo/yolo11n.pt` la primera vez y se reutiliza (montado como volumen en Docker).
 
 ### TripoSR — generar asset
 ```bash
