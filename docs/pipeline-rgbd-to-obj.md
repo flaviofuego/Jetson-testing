@@ -28,7 +28,8 @@ Generar assets 3D (OBJ + SDF) listos para simulación robótica con Drake, a par
 | Componente | Tecnología | Repositorio |
 |------------|-----------|-------------|
 | Depth Estimation | Depth Anything 3 (DA3NESTED-GIANT-LARGE) | ByteDance |
-| Segmentación | SAM2.1 small (Meta) | `cristian10gf/sam2` (fork) |
+| Segmentación (automática) | SAM2.1 small — AMG mode (Meta) | `cristian10gf/sam2` (fork) |
+| Segmentación (YOLO+SAM2) | YOLOv11 nano + SAM2ImagePredictor | ultralytics + Meta |
 | Point Cloud Completion | P2C (Partial2Complete) | `CuiRuikai/Partial2Complete` |
 | Surface Reconstruction | NU-MCC (CO3D-V2 checkpoint) | `sail-sg/numcc` |
 | Meshing Neural | nksr (Neural Kernel Surface Reconstruction) | `nv-tlabs/nksr` |
@@ -86,7 +87,7 @@ flowchart TD
     DA3 --> DA3_OUT
 
     subgraph SAM2_STAGE["Stage 2 — SAM2 (Docker sam2:x86)"]
-        SAM2["SAM2AutomaticMaskGenerator\nsam2.1_hiera_small.pt"]
+        SAM2["SAM2AutomaticMaskGenerator\nsam2.1_hiera_small.pt\nó YOLO+SAM2ImagePredictor"]
         SAM2_OUT["name_segmask.npy uint8\nname.png (white bg)"]
     end
 
@@ -354,7 +355,7 @@ docker run --rm --gpus all \
 - Checkpoint en `~/models/sam2/sam2.1_hiera_small.pt`
 - GPU con `--gpus all` (x86) o `--runtime=nvidia` (Jetson)
 
-#### Troubleshooting
+#### Troubleshooting SAM2 AMG
 
 | Problema | Síntoma | Causa | Solución |
 |---------|---------|-------|----------|
@@ -362,6 +363,135 @@ docker run --rm --gpus all \
 | `sam2._C` no compilado | Warning en logs | CUDA ext no compiló en imagen x86 | Funcional igual, solo sin post-processing de huecos |
 | Checkpoint no encontrado | FileNotFoundError | `~/models/sam2/` vacío | Ejecutar `cd submodules/sam2/checkpoints && bash download_ckpts.sh` |
 | GPU OOM | CUDA out of memory | Imagen muy grande | Redimensionar imagen antes |
+| Arco de audífonos no detectado | Mask incompleta | AMG filtra arcos delgados (IoU < 0.88) | Bajar thresholds: `--pred-iou-thresh 0.70 --stability-score-thresh 0.80` |
+| Objeto fuera de COCO80 | AMG elige fondo | No hay clase semántica → seed incorrecto | Usar `pipeline_yolo_sam2.py` o `pipeline_interactive.py` |
+
+---
+
+### Fase 2b — YOLO + SAM2 (variante sin tuneo de thresholds)
+
+#### Propósito
+
+Alternativa a AMG para objetos donde tunear `pred_iou_thresh` / `stability_score_thresh` es impracticable. YOLOv11 detecta el bounding box del objeto; ese bbox se pasa como prompt a `SAM2ImagePredictor` (bbox mode). SAM2 segmenta solo dentro de esa región → no hay que tuneo por objeto.
+
+**Por qué YOLO + SAM2 es superior a AMG puro para casos difíciles:**
+- AMG no sabe qué objeto quieres → tiene que adivinar → thresholds distintos por objeto
+- YOLO detecta bbox semántico → SAM2ImagePredictor genera máscara precisa dentro del bbox
+- Un solo pipeline sirve para cualquier objeto sin configuración
+
+**Limitación YOLO:** el modelo nano (yolo11n.pt, 6 MB) reconoce las 80 clases COCO. Objetos fuera de COCO80 (taladro, audífonos, destornillador) se detectan bajo una clase incorrecta pero con bbox correcto. Usar `--any-class` o `--conf 0.10`.
+
+#### Archivos
+
+| Archivo | Función |
+|---------|---------|
+| `submodules/sam2/pipeline_yolo_sam2.py` | Script principal — auto-relaunch en Docker, YOLO + SAM2, save outputs |
+| `~/models/yolo/yolo11n.pt` | Pesos YOLOv11 nano (descarga automática primer uso, 6 MB) |
+
+#### Comandos
+
+```bash
+# Objeto en COCO80 (taza=cup, botella=bottle, silla=chair)
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/taza/taza.jpeg \
+  --output data/outputs \
+  --name taza \
+  --class-name cup
+
+# Objeto fuera de COCO80 — detección de mayor confianza sin filtro de clase
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/taladro.JPG \
+  --output data/outputs \
+  --name taladro \
+  --any-class --conf 0.10
+
+# Escena multi-objeto — el usuario elige con click (requiere X11)
+xhost +local:docker
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/escena.jpg \
+  --output data/outputs \
+  --name objeto \
+  --interactive --conf 0.10
+
+# Objeto con cavidades huecas en superficie (earpads, foam circular)
+.venv/bin/python3 submodules/sam2/pipeline_yolo_sam2.py \
+  --input data/images/headphones/headphones_centro.jpeg \
+  --output data/outputs \
+  --name headphones \
+  --any-class --fill-holes
+```
+
+#### Parámetros
+
+| Parámetro | Default | Descripción |
+|-----------|---------|-------------|
+| `--class-name` | — | Filtrar por nombre COCO (e.g. `cup`) |
+| `--class-id` | — | Filtrar por ID COCO (e.g. `41` para cup) |
+| `--any-class` | — | Mayor confianza sin filtro de clase |
+| `--interactive` | — | Ventana matplotlib con todos los bboxes, click para elegir |
+| `--conf` | 0.25 | YOLO confidence threshold. Bajar a 0.10 para objetos fuera de COCO80 |
+| `--yolo-model` | `yolo11n.pt` | Variante YOLOv11 (nano=6MB, recomendado) |
+| `--sam2-model` | `small` | `tiny`, `small`, `base_plus` |
+| `--fill-holes` | False | Rellena cavidades cerradas de 500–20K px² en la mask. Usar para objetos con superficies huecas (earpads). **No usar** para objetos con agujeros reales (asa de taza). |
+
+#### Procesamiento interno
+
+```
+1. Detección YOLO: YOLO(image_np, conf=conf, device=device) → boxes
+2. Filtro de clase (si --class-name o --class-id) o sort por conf (--any-class)
+3. Selección de detección: [0] (mayor conf) o click en ventana (--interactive)
+4. SAM2ImagePredictor.set_image(image_np)
+5. predictor.predict(box=[[x1,y1,x2,y2]], multimask_output=True) → 3 masks + scores
+6. Selección mask: masks[scores.argmax()]
+7. fill_holes opcional: binary_fill_holes → label → filtrar huecos 500–20K px²
+8. save_outputs: PNG fondo blanco + segmask.npy + viz.png con bbox YOLO en amarillo
+```
+
+**`--fill-holes` detalle:** `binary_fill_holes` global llena también el espacio abierto entre regiones (ej. espacio entre copas de audífonos: ~77K px²). La implementación detecta huecos individuales por `scipy.ndimage.label` y solo rellena los que caen en 500–20K px² → preserva espacios abiertos grandes y agujeros geométricos reales.
+
+**Selección de mask por `argmax(scores)` vs `argmax(areas)`:** `argmax(scores)` = mask de mayor confianza de SAM2, generalmente el objeto preciso sin fondo. `argmax(areas)` puede incluir fondo dentro del bbox → se usa `argmax(scores)`.
+
+#### Cache de modelo YOLO
+
+`yolo11n.pt` se descarga a `~/models/yolo/yolo11n.pt` (montado como volumen en Docker) en el primer uso. Las siguientes corridas cargan desde el volumen sin descargar.
+
+```bash
+ls -lh ~/models/yolo/yolo11n.pt
+# -rw-r--r-- 1 root root 5.4M ...  (propiedad root porque Docker lo crea)
+```
+
+#### COCO80 — clases relevantes
+
+| Clase | ID | Objetos típicos |
+|-------|----|-----------------|
+| cup | 41 | taza, vaso, mug |
+| bottle | 39 | botella, frasco |
+| chair | 56 | silla |
+| laptop | 63 | laptop |
+| cell phone | 67 | teléfono |
+| scissors | 76 | similar a audífonos (match aproximado) |
+
+Taladro, audífonos, destornillador → **no en COCO80** → usar `--any-class --conf 0.10` o `--interactive`.
+
+#### Benchmarks (RTX 4000 Ada, sam2:x86)
+
+| Objeto | Detección YOLO | Clase detectada | conf | Mask px² | Correcto |
+|--------|---------------|-----------------|------|----------|----------|
+| taza.jpeg | cup | cup | 0.93 | ~74K | ✓ |
+| taza2.jpeg | cup | cup | 0.95 | ~84K | ✓ |
+| headphones_centro.jpeg | scissors | scissors | 0.64 | ~86K (sin fill) / ~98K (con fill) | ✓ |
+| headphones_derecho.jpeg | scissors | scissors | 0.28 | ~90K | ✓ |
+| taladro.JPG | — | — | <0.25 | no detectado | usar --conf 0.10 |
+
+#### Troubleshooting YOLO + SAM2
+
+| Problema | Síntoma | Causa | Solución |
+|---------|---------|-------|----------|
+| No detections | `ERROR: No YOLO detections found` | Objeto fuera de COCO80, conf muy alto | `--any-class --conf 0.10` o `--interactive` |
+| Mask con agujeros en earpads | Huecos dentro de almohadillas | SAM2 trata interior como fondo | `--fill-holes` |
+| `--fill-holes` rellena asa de taza | Agujero real rellenado | Asa cae en rango 500-20K px² | No usar `--fill-holes` para objetos con agujeros reales |
+| Bbox incorrecto (objeto equivocado) | SAM2 segmenta objeto no deseado | YOLO elige detección incorrecta | `--interactive` para elegir manualmente |
+| YOLO descarga cada run | Downloading... en cada ejecución | Modelo no persistido en volumen | Verificar `~/models/yolo/yolo11n.pt` existe en host |
 
 ---
 
@@ -938,7 +1068,23 @@ sudo chown -R $USER:$USER assets/
 | Tiempo inferencia | ~2.4s (RTX 4000 Ada) |
 | Docker | `sam2:x86` |
 
-### 5.3 P2C (Partial2Complete)
+### 5.3 YOLOv11 nano (Ultralytics)
+
+| Campo | Valor |
+|-------|-------|
+| Nombre | YOLOv11 nano (yolo11n) |
+| Arquitectura | YOLO one-stage detector (Ultralytics, 2024) |
+| Checkpoint | `yolo11n.pt` (5.4 MB, descarga automática desde GitHub Releases) |
+| Ubicación | `~/models/yolo/yolo11n.pt` |
+| Inputs | Imagen numpy `(H, W, 3)` uint8 |
+| Outputs | Bboxes `[x1, y1, x2, y2]` + conf + class_id por detección |
+| Clases | 80 clases COCO. Objetos fuera de COCO80 → match aproximado |
+| Requiere GPU | No (CPU suficiente), GPU si disponible |
+| Tiempo inferencia | <1s (CPU o GPU) |
+| Docker | `sam2:x86` (ultralytics incluido en builder stage) |
+| Uso | Solo para `pipeline_yolo_sam2.py` — provee bbox prompt a SAM2ImagePredictor |
+
+### 5.4 P2C (Partial2Complete)
 
 | Campo | Valor |
 |-------|-------|
@@ -951,7 +1097,7 @@ sudo chown -R $USER:$USER assets/
 | Estado | Fallback gracioso si mismatch de arquitectura |
 | Requiere GPU | Sí |
 
-### 5.4 NU-MCC (Multiview Compressive Coding, CO3D-V2)
+### 5.5 NU-MCC (Multiview Compressive Coding, CO3D-V2)
 
 | Campo | Valor |
 |-------|-------|
@@ -970,7 +1116,7 @@ sudo chown -R $USER:$USER assets/
 | Docker | `numcc:x86` |
 | LIMITACIÓN | Solo densifica superficie visible. No genera parte trasera desde una imagen. |
 
-### 5.5 nksr (Neural Kernel Surface Reconstruction)
+### 5.6 nksr (Neural Kernel Surface Reconstruction)
 
 | Campo | Valor |
 |-------|-------|
@@ -1113,25 +1259,52 @@ docker run --rm --gpus all \
 
 ### 7.2 sam2:x86
 
-**Base:** `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel`
-**ENTRYPOINT:** ninguno (se usa `--entrypoint python3`)
+**Base:** `pytorch/pytorch:2.5.1-cuda12.1-cudnn9-devel` (Dockerfile.x86-server) / `pytorch:2.7.0-cuda12.8` (Dockerfile.x86)
+**ENTRYPOINT:** `python3` (configurado en Dockerfile)
+
+**Scripts incluidos en la imagen:**
+- `pipeline.py` — SAM2 AMG automático
+- `pipeline_interactive.py` — selector interactivo point-click
+- `pipeline_yolo_sam2.py` — YOLO + SAM2ImagePredictor (bbox mode)
+
+**Dependencias Python (builder stage):** `opencv-python-headless`, `numpy`, `pillow`, `matplotlib`, `ultralytics` (YOLOv11), `scipy`
 
 ```bash
 # Build
-docker build -t sam2:x86 -f submodules/sam2/Dockerfile.x86 submodules/sam2/
+docker build -t sam2:x86 -f submodules/sam2/Dockerfile.x86-server submodules/sam2/
 
-# Run
+# Run — SAM2 AMG (pipeline.py)
 docker run --rm --gpus all \
     -v "$(pwd)/data/images":/input:ro \
     -v "$(pwd)/data/outputs":/output \
     -v "$HOME/models/sam2":/opt/sam2/checkpoints:ro \
-    -v "$(pwd)/submodules/sam2/pipeline.py":/opt/sam2/pipeline.py:ro \
     --entrypoint python3 \
     sam2:x86 /opt/sam2/pipeline.py \
     --input /input/objeto.jpg \
     --output /output \
     --name objeto
+
+# Run — YOLO + SAM2 (pipeline_yolo_sam2.py) — normalmente via wrapper host
+docker run --rm --gpus all \
+    -v "$(pwd)/data/images/taza":/input:ro \
+    -v "$(pwd)/data/outputs":/output \
+    -v "$HOME/models/sam2":/opt/sam2/checkpoints:ro \
+    -v "$HOME/models/yolo":/opt/yolo \
+    -e YOLO_CONFIG_DIR=/opt/yolo \
+    --entrypoint python3 \
+    sam2:x86 /opt/sam2/pipeline_yolo_sam2.py \
+    --input /input/taza.jpeg \
+    --output /output \
+    --name taza \
+    --class-name cup
 ```
+
+**Volúmenes YOLO+SAM2:**
+
+| Volumen host | Mount container | Contenido |
+|-------------|----------------|-----------|
+| `~/models/sam2` | `/opt/sam2/checkpoints` | Checkpoints SAM2 (ro) |
+| `~/models/yolo` | `/opt/yolo` | yolo11n.pt + settings Ultralytics (rw — para descargar modelo) |
 
 ---
 
@@ -1796,8 +1969,11 @@ Jetson-testing/
 ├── submodules/
 │   ├── sam2/                           # Submódulo fork cristian10gf/sam2
 │   │   ├── Dockerfile.jetson           # GPU ARM64
-│   │   ├── Dockerfile.x86              # GPU x86
-│   │   ├── pipeline.py                 # Segmentación SAM2 (ENTRYPOINT)
+│   │   ├── Dockerfile.x86              # GPU x86 CUDA 12.8
+│   │   ├── Dockerfile.x86-server       # GPU x86 CUDA 12.1 (imagen activa sam2:x86)
+│   │   ├── pipeline.py                 # SAM2 AMG automático (ENTRYPOINT)
+│   │   ├── pipeline_interactive.py     # Selector interactivo point-click (X11)
+│   │   ├── pipeline_yolo_sam2.py       # YOLO + SAM2ImagePredictor (bbox prompt)
 │   │   ├── checkpoints/
 │   │   │   └── download_ckpts.sh
 │   │   └── sam2/                       # Código SAM2
